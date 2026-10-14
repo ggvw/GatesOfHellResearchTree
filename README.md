@@ -169,6 +169,12 @@ research_tree_html/            Generated website (ignored)
 When changing a parser, test against a current unmodified game installation and
 run both stages end to end. Please avoid committing generated game data or assets.
 
+## License
+
+This project's source code and documentation are licensed under the [MIT License](LICENSE).
+The license does not cover game data or assets extracted from an installed copy of
+Call to Arms: Gates of Hell — Ostfront.
+
 This is an unofficial community project and is not affiliated with Barbedwire
 Studios or Digitalmindsoft. Game names and assets belong to their respective
 owners.
