@@ -1479,10 +1479,15 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     details.classList.remove('open');
   }
 
+  const hiddenStatFields = new Set([
+    'id', 'definition_type', 'cp_source', 'position_x', 'position_y',
+    'source_asset', 'portrait_id', 'icon_id', 'path', 'skin'
+  ]);
+
   function statRows(object, omitted = new Set()) {
     if (!object) return '<p class="muted">None</p>';
     return '<dl class="stats">' + Object.entries(object)
-      .filter(([key, value]) => !omitted.has(key) && shown(value))
+      .filter(([key, value]) => !hiddenStatFields.has(key) && !omitted.has(key) && shown(value))
       .map(([key, value]) => `<dt>${esc(label(key))}</dt><dd>${formatValue(value)}</dd>`).join('') + '</dl>';
   }
 
@@ -1506,11 +1511,11 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     }).join('');
     const requirementNames = [...required].map(id => byId.get(id)?.display_name || id);
     detailContent.innerHTML = `
-      <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.id)}</div><div class="muted">${esc(node.node_type)}</div></div></div>
+      <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
       <div class="totals"><div class="total"><strong>${esc(number(node.cost))}</strong>Own RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
       <h3>Unlock prerequisites (${required.size})</h3>${requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>'}
-      <h3>Research data</h3>${statRows({cost: node.cost, indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', position_x: node.position.x, position_y: node.position.y, source_asset: node.image?.source_asset})}
+      <h3>Research data</h3>${statRows({cost: node.cost, indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'})}
       <h3>Aggregate unit stats</h3>${statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time})}
       <h3>Unit stats</h3>${statRows(unit, new Set(['raw', 'members', 'id']))}
       ${memberHtml ? `<h3>Unit members (${node.members.length})</h3>${memberHtml}` : ''}`;
