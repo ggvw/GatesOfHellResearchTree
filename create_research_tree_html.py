@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Build a self-contained, interactive HTML viewer from exported research data."""
 
 import argparse
 import json
@@ -7,13 +8,17 @@ import re
 import shutil
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 
 try:
     from PIL import Image
 except ImportError as exc:
-    raise SystemExit("Pillow is required to convert the game's TGA images: python3 -m pip install Pillow") from exc
+    raise SystemExit(
+        "Pillow is required to convert the game's TGA images: "
+        "python3 -m pip install Pillow"
+    ) from exc
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -29,6 +34,38 @@ REQUIRED_GAME_FILES = {
 }
 
 
+@dataclass(frozen=True)
+class GameFiles:
+    """Game archives needed to enrich the exported research data."""
+
+    vehicle_archive: Path
+    game_logic_archive: Path
+    localization_archive: Path
+
+    @classmethod
+    def from_game_directory(cls, game_directory: Path) -> "GameFiles":
+        paths = {
+            name: (game_directory / relative_path).resolve()
+            for name, relative_path in REQUIRED_GAME_FILES.items()
+        }
+        return cls(
+            vehicle_archive=paths["vehicle_archive"],
+            game_logic_archive=paths["gamelogic_archive"],
+            localization_archive=paths["localization_archive"],
+        )
+
+    def missing(self) -> list[Path]:
+        return [
+            path
+            for path in (
+                self.vehicle_archive,
+                self.game_logic_archive,
+                self.localization_archive,
+            )
+            if not path.is_file()
+        ]
+
+
 def log(message: str) -> None:
     print(f"[research-tree-html] {message}", flush=True)
 
@@ -39,6 +76,7 @@ def safe_filename(value: str) -> str:
 
 
 def load_trees(input_dir: Path) -> list[dict]:
+    """Load and validate every faction JSON file from the exporter."""
     json_paths = sorted(input_dir.glob("*.json"))
     if not json_paths:
         raise RuntimeError(f"No faction JSON files found in {input_dir}")
@@ -67,6 +105,7 @@ def load_trees(input_dir: Path) -> list[dict]:
 
 
 def _po_value(lines: list[str], key: str) -> str | None:
+    """Read one possibly multi-line string from a gettext PO block."""
     def decode_quoted(value: str) -> str:
         body = value[1:-1]
         escapes = {"\\": "\\", '"': '"', "n": "\n", "r": "\r", "t": "\t"}
@@ -80,13 +119,17 @@ def _po_value(lines: list[str], key: str) -> str | None:
             if not continuation.startswith('"'):
                 break
             parts.append(continuation.strip())
-        if any(len(part) < 2 or not part.startswith('"') or not part.endswith('"') for part in parts):
+        if any(
+            len(part) < 2 or not part.startswith('"') or not part.endswith('"')
+            for part in parts
+        ):
             return None
         return "".join(decode_quoted(part) for part in parts)
     return None
 
 
 def annotate_localized_names(trees: list[dict], localization_archive: Path) -> tuple[int, int]:
+    """Replace internal identifiers with localized names and infantry levels."""
     if not localization_archive.is_file():
         raise RuntimeError(f"Localization archive not found: {localization_archive}")
 
@@ -130,7 +173,10 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
                     f"main_menu2/dynamic_campaign/{plain_id}",
                 ]
             )
-            message = next((localized[context] for context in candidates if context in localized), None)
+            message = next(
+                (localized[context] for context in candidates if context in localized),
+                None,
+            )
             node["localization_context"] = next(
                 (context for context in candidates if context in localized), None
             )
@@ -154,6 +200,7 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
 
 
 def _named_parenthesized_blocks(text: str, prefix: str) -> dict[str, str]:
+    """Extract balanced parenthesized blocks following a named prefix."""
     blocks = {}
     for match in re.finditer(re.escape(prefix) + r'"([^"]+)"', text):
         start = match.start()
@@ -167,6 +214,76 @@ def _named_parenthesized_blocks(text: str, prefix: str) -> dict[str, str]:
                     blocks[match.group(1)] = text[start : index + 1]
                     break
     return blocks
+
+
+def armor_thickness(definition_text: str) -> tuple[float | None, float | None]:
+    """Return the best front-armor estimate and maximum armor value."""
+    front = [
+        float(value)
+        for value in re.findall(
+            r"\{front\s+([0-9.]+)\s*\}", definition_text, re.IGNORECASE
+        )
+    ]
+    thickness = [
+        float(value)
+        for value in re.findall(
+            r"\{thickness\s+([0-9.]+)", definition_text, re.IGNORECASE
+        )
+    ]
+    shields = [
+        float(value)
+        for value in re.findall(
+            r'\("shield(?:_group)?"\s+args\s+"[^"]+"\s+([0-9.]+)',
+            definition_text,
+            re.IGNORECASE,
+        )
+    ]
+    fallback_front = max(thickness + shields, default=None)
+    return (
+        max(front) if front else fallback_front,
+        max(front + thickness + shields, default=None),
+    )
+
+
+def classify_unit(
+    unit: dict,
+    definition_paths: list[str],
+    *,
+    indirect_fire: bool,
+    at_cannon: bool,
+) -> str:
+    """Map game-specific definitions to the viewer's broad filter classes."""
+    definition_type = str(unit.get("definition_type") or "")
+    if at_cannon:
+        return "at-cannon"
+    if indirect_fire:
+        return "artillery"
+    if definition_type.startswith("squad") and definition_type != "squad_vehicle":
+        return "infantry"
+    if any("/tank_" in path for path in definition_paths):
+        return "tanks"
+    return "other"
+
+
+def annotate_infantry_equipment(node: dict, at_hand_weapons: set[str]) -> None:
+    """Count soldiers with handheld AT weapons and detect carried shovels."""
+    node["anti_tank_weapon_count"] = 0
+    node["has_shovel"] = False
+    if node["unit_class"] != "infantry":
+        return
+
+    for member in node.get("members") or []:
+        inventory = (member.get("breed_file") or {}).get("inventory_items") or []
+        item_names = [str(item.get("item") or "") for item in inventory]
+        if any(re.match(r"^shovel(?:_|$)", name, re.IGNORECASE) for name in item_names):
+            node["has_shovel"] = True
+
+        normalized_items = {
+            re.sub(r"\s+(?:weapon|grenade)$", "", name, flags=re.IGNORECASE).lower()
+            for name in item_names
+        }
+        if normalized_items & at_hand_weapons:
+            node["anti_tank_weapon_count"] += int(member.get("count") or 0)
 
 
 def annotate_unit_metadata(
@@ -318,44 +435,19 @@ def annotate_unit_metadata(
                 if node["main_gun_caliber_mm"] is not None:
                     caliber_count += 1
 
-                front_values = [
-                    float(value)
-                    for value in re.findall(r"\{front\s+([0-9.]+)\s*\}", definition_text, re.IGNORECASE)
-                ]
-                thickness_values = [
-                    float(value)
-                    for value in re.findall(r"\{thickness\s+([0-9.]+)", definition_text, re.IGNORECASE)
-                ]
-                shield_values = [
-                    float(value)
-                    for value in re.findall(
-                        r'\("shield(?:_group)?"\s+args\s+"[^"]+"\s+([0-9.]+)',
-                        definition_text,
-                        re.IGNORECASE,
-                    )
-                ]
-                node["front_armor_thickness_mm"] = (
-                    max(front_values)
-                    if front_values
-                    else max(thickness_values + shield_values, default=None)
-                )
-                node["maximum_armor_thickness_mm"] = max(
-                    front_values + thickness_values + shield_values, default=None
-                )
+                (
+                    node["front_armor_thickness_mm"],
+                    node["maximum_armor_thickness_mm"],
+                ) = armor_thickness(definition_text)
                 if node["front_armor_thickness_mm"] is not None:
                     armor_count += 1
 
-                definition_type = str(unit.get("definition_type") or "")
-                if node["at_cannon"]:
-                    node["unit_class"] = "at-cannon"
-                elif node["indirect_fire"]:
-                    node["unit_class"] = "artillery"
-                elif definition_type.startswith("squad") and definition_type != "squad_vehicle":
-                    node["unit_class"] = "infantry"
-                elif any("/tank_" in path for path in definition_paths):
-                    node["unit_class"] = "tanks"
-                else:
-                    node["unit_class"] = "other"
+                node["unit_class"] = classify_unit(
+                    unit,
+                    definition_paths,
+                    indirect_fire=node["indirect_fire"],
+                    at_cannon=node["at_cannon"],
+                )
 
                 node["infantry_level"] = (
                     node.get("unit_level") if node["unit_class"] == "infantry" else None
@@ -363,37 +455,13 @@ def annotate_unit_metadata(
                 node["infantry_level_label"] = (
                     node.get("unit_level_label") if node["unit_class"] == "infantry" else None
                 )
-                node["anti_tank_weapon_count"] = 0
-                node["has_shovel"] = False
-                if node["unit_class"] == "infantry":
-                    for member in node.get("members") or []:
-                        inventory = (member.get("breed_file") or {}).get("inventory_items") or []
-                        if any(
-                            re.match(
-                                r"^shovel(?:_|$)",
-                                str(item.get("item") or ""),
-                                re.IGNORECASE,
-                            )
-                            for item in inventory
-                        ):
-                            node["has_shovel"] = True
-                        carries_at_hand_weapon = any(
-                            re.sub(
-                                r"\s+(?:weapon|grenade)$",
-                                "",
-                                str(item.get("item") or ""),
-                                flags=re.IGNORECASE,
-                            ).lower()
-                            in infantry_at_hand_weapons
-                            for item in inventory
-                        )
-                        if carries_at_hand_weapon:
-                            node["anti_tank_weapon_count"] += int(member.get("count") or 0)
+                annotate_infantry_equipment(node, infantry_at_hand_weapons)
 
     return indirect_count, reload_count, armor_count, caliber_count
 
 
 def convert_images(trees: list[dict], input_dir: Path, output_dir: Path) -> tuple[int, list[str]]:
+    """Convert exported TGA/PNG assets into browser-compatible PNG files."""
     assets_dir = output_dir / "assets"
     converted = 0
     missing = []
@@ -435,9 +503,14 @@ def convert_images(trees: list[dict], input_dir: Path, output_dir: Path) -> tupl
 
 
 def write_html(trees: list[dict], output_dir: Path) -> Path:
+    """Embed all research data in a single portable HTML document."""
     # Prevent data from accidentally terminating its enclosing script element.
     embedded_json = json.dumps(trees, ensure_ascii=False, separators=(",", ":"))
-    embedded_json = embedded_json.replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    embedded_json = (
+        embedded_json.replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
     html = HTML_TEMPLATE.replace("__TREE_DATA__", embedded_json)
     target = output_dir / "index.html"
     target.write_text(html, encoding="utf-8")
@@ -455,10 +528,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "game_path",
         type=Path,
-        help="required path to the game's resource directory (the directory containing gamelogic.pak)",
+        help=(
+            "required path to the game's resource directory "
+            "(the directory containing gamelogic.pak)"
+        ),
     )
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_DIR, help=f"directory containing faction JSON and images (default: {DEFAULT_INPUT_DIR})")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR, help=f"directory to replace with the generated site (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        help=f"directory containing faction JSON and images (default: {DEFAULT_INPUT_DIR})",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"directory to replace with the generated site (default: {DEFAULT_OUTPUT_DIR})",
+    )
     return parser.parse_args()
 
 
@@ -467,21 +553,23 @@ def main() -> None:
     game_resource_dir = args.game_path.resolve()
     input_dir = args.input.resolve()
     output_dir = args.output.resolve()
-    required_files = {
-        name: (game_resource_dir / relative_path).resolve()
-        for name, relative_path in REQUIRED_GAME_FILES.items()
-    }
-    missing_files = [str(path) for path in required_files.values() if not path.is_file()]
+    game_files = GameFiles.from_game_directory(game_resource_dir)
+    missing_files = [str(path) for path in game_files.missing()]
     if missing_files:
         raise RuntimeError(f"Required game file(s) not found: {', '.join(missing_files)}")
     if not input_dir.is_dir():
-        raise RuntimeError(f"Input directory does not exist: {input_dir}. Run export_research_trees.py first.")
+        raise RuntimeError(
+            f"Input directory does not exist: {input_dir}. "
+            "Run export_research_trees.py first."
+        )
     if output_dir in (input_dir, game_resource_dir, SCRIPT_DIR):
-        raise RuntimeError("Output directory must differ from the input and game resource directories")
+        raise RuntimeError(
+            "Output directory must differ from the input and game resource directories"
+        )
 
     trees = load_trees(input_dir)
     localized_name_count, localized_level_count = annotate_localized_names(
-        trees, required_files["localization_archive"]
+        trees, game_files.localization_archive
     )
     log(
         f"Resolved {localized_name_count} in-game unit names and "
@@ -489,10 +577,13 @@ def main() -> None:
     )
     indirect_count, reload_count, armor_count, caliber_count = annotate_unit_metadata(
         trees,
-        required_files["vehicle_archive"],
-        required_files["gamelogic_archive"],
+        game_files.vehicle_archive,
+        game_files.game_logic_archive,
     )
-    log(f"Detected indirect-fire capability on {indirect_count} research nodes from game entity definitions")
+    log(
+        f"Detected indirect-fire capability on {indirect_count} research nodes "
+        "from game entity definitions"
+    )
     log(f"Resolved primary-weapon reload time for {reload_count} research nodes")
     log(f"Resolved frontal armor thickness for {armor_count} research nodes")
     log(f"Resolved main-gun caliber for {caliber_count} research nodes")

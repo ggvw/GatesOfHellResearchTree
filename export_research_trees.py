@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""Export Gates of Hell conquest research trees from the installed game files."""
 
 import json
 import re
@@ -6,6 +7,7 @@ import shutil
 import sys
 from argparse import ArgumentParser
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -37,6 +39,30 @@ INFANTRY_ROLE_CLASS_FALLBACKS = {
 }
 
 
+@dataclass(frozen=True)
+class ArchivePaths:
+    """Absolute paths to the game archives used by the exporter."""
+
+    game_logic: Path
+    interface_scene: Path
+    interface_pages: Path
+
+    @classmethod
+    def from_game_directory(cls, game_directory: Path) -> "ArchivePaths":
+        paths = {
+            name: (game_directory / relative_path).resolve()
+            for name, relative_path in REQUIRED_GAME_FILES.items()
+        }
+        return cls(
+            game_logic=paths["gamelogic"],
+            interface_scene=paths["interface_scene"],
+            interface_pages=paths["interface_pages"],
+        )
+
+    def all(self) -> tuple[Path, Path, Path]:
+        return self.game_logic, self.interface_scene, self.interface_pages
+
+
 def log(message: str, *, quiet: bool = False) -> None:
     if not quiet:
         print(f"[research-export] {message}", flush=True)
@@ -56,6 +82,7 @@ def read_text(zf: ZipFile, name: str) -> str:
 
 
 def extract_named_blocks(text: str) -> dict[str, str]:
+    """Return top-level brace blocks keyed by their first quoted value."""
     blocks: dict[str, str] = {}
     start = None
     depth = 0
@@ -80,6 +107,7 @@ def extract_named_blocks(text: str) -> dict[str, str]:
 
 
 def extract_named_tuples(text: str) -> dict[str, str]:
+    """Return top-level unit tuples keyed by their name(...) token."""
     tuples: dict[str, str] = {}
     start = None
     depth = 0
@@ -105,6 +133,7 @@ def extract_named_tuples(text: str) -> dict[str, str]:
 
 
 def parse_token_map(text: str) -> dict[str, list[str]]:
+    """Collect the game's key(value) tokens while preserving repeated keys."""
     token_map: dict[str, list[str]] = defaultdict(list)
     for key, value in re.findall(r'([A-Za-z0-9_]+)\(([^()]*)\)', text):
         token_map[key].append(value.strip())
@@ -112,9 +141,11 @@ def parse_token_map(text: str) -> dict[str, list[str]]:
 
 
 def parse_research_entries(text: str) -> list[dict]:
+    """Parse the compact research-node records from a faction research file."""
     entries = []
     pattern = re.compile(
-        r'\{\s*(tech\s+)?"([^"]+)"\s*requires\s*"([^"]*)"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+)\s+(-?\d+)\s*\}'
+        r'\{\s*(tech\s+)?"([^"]+)"\s*requires\s*"([^"]*)"'
+        r"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+)\s+(-?\d+)\s*\}"
     )
     for match in pattern.finditer(text):
         entries.append(
@@ -232,6 +263,7 @@ def sanitize_filename(value: str) -> str:
 
 
 def parse_breed_file(text: str) -> dict:
+    """Extract the human-readable subset of a soldier breed definition."""
     result = {
         "skin": None,
         "portrait_id": None,
@@ -260,7 +292,10 @@ def parse_breed_file(text: str) -> dict:
     result["veterancy"] = re.findall(r'\("([^"]+)"\)', _section_text(text, "veterancy"))
     result["armor_parts"] = [
         {"slot": slot, "item": item}
-        for slot, item in re.findall(r"\{([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\}", _section_text(text, "armors"))
+        for slot, item in re.findall(
+            r"\{([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\}",
+            _section_text(text, "armors"),
+        )
     ]
     return result
 
@@ -295,6 +330,7 @@ def choose_image(
     node_id: str,
     breed_details: list[dict],
 ) -> tuple[str | None, bytes | None]:
+    """Find the best available portrait or icon for a research node."""
     candidates = [
         f"scene/portrait_squad/{node_id}_00.png",
         f"scene/portrait_squad/{node_id}_00.tga",
@@ -304,7 +340,11 @@ def choose_image(
         f"scene/unit_icon_small/{node_id}_00.tga",
     ]
 
-    portrait_ids = [detail.get("portrait_id") for detail in breed_details if detail.get("portrait_id")]
+    portrait_ids = [
+        detail.get("portrait_id")
+        for detail in breed_details
+        if detail.get("portrait_id")
+    ]
     icon_ids = [detail.get("icon_id") for detail in breed_details if detail.get("icon_id")]
 
     for portrait_id in portrait_ids:
@@ -334,7 +374,10 @@ def choose_image(
     return None, None
 
 
-def build_unit_lookup(faction: str, gamelogic_zip: ZipFile) -> tuple[dict[str, str], dict[str, dict], dict[str, list[str]]]:
+def build_unit_lookup(
+    faction: str, gamelogic_zip: ZipFile
+) -> tuple[dict[str, str], dict[str, dict], dict[str, list[str]]]:
+    """Load unit definitions, soldier declarations, and breed file locations."""
     inf_text = read_text(gamelogic_zip, ROSTER_INF_PATH_TEMPLATE.format(faction=faction))
     units_text = read_text(gamelogic_zip, ROSTER_UNIT_PATH_TEMPLATE.format(faction=faction))
 
@@ -365,7 +408,13 @@ def parse_unit_block(node_id: str, block: str) -> dict:
             for value in token_map[key]:
                 if ":" in value:
                     alias, count = value.split(":", 1)
-                    members.append({"slot": key, "alias": alias.strip(), "count": int(count.strip())})
+                    members.append(
+                        {
+                            "slot": key,
+                            "alias": alias.strip(),
+                            "count": int(count.strip()),
+                        }
+                    )
 
     unit_count = sum(member["count"] for member in members) if members else None
     return {
@@ -391,7 +440,13 @@ def parse_unit_block(node_id: str, block: str) -> dict:
     }
 
 
-def resolve_breed_path(alias: str, unit_side: str | None, unit_period: str | None, breed_paths: dict[str, list[str]]) -> str | None:
+def resolve_breed_path(
+    alias: str,
+    unit_side: str | None,
+    unit_period: str | None,
+    breed_paths: dict[str, list[str]],
+) -> str | None:
+    """Prefer a breed file matching the unit's faction and time period."""
     candidates = breed_paths.get(alias, [])
     if not candidates:
         return None
@@ -410,17 +465,105 @@ def resolve_breed_path(alias: str, unit_side: str | None, unit_period: str | Non
     return candidates[0]
 
 
+def replace_output_directory(output_dir: Path, *, quiet: bool) -> None:
+    """Create an empty output directory, replacing an earlier export."""
+    if output_dir.exists():
+        existing_files = sum(path.is_file() for path in output_dir.rglob("*"))
+        log(
+            f"Removing existing output directory {output_dir} "
+            f"({existing_files} files) so all output is replaced",
+            quiet=quiet,
+        )
+        shutil.rmtree(output_dir)
+    else:
+        log(f"Creating output directory {output_dir}", quiet=quiet)
+    (output_dir / "images").mkdir(parents=True)
+
+
+def describe_unit_members(
+    unit: dict,
+    declarations: dict[str, dict],
+    breed_paths: dict[str, list[str]],
+    infantry_role_cp: dict[str, int | float],
+    gamelogic_zip: ZipFile,
+) -> tuple[list[dict], float, int]:
+    """Resolve a unit's members and calculate inherited command points."""
+    details = []
+    total_cost = 0.0
+    total_command_points = 0.0
+    all_command_points_known = True
+    resolved_breed_count = 0
+
+    for member in unit["members"]:
+        alias = member["alias"]
+        count = member["count"]
+        declaration = declarations.get(alias)
+        breed_path = resolve_breed_path(
+            alias, unit["side"], unit["period"], breed_paths
+        )
+        breed = None
+        if breed_path:
+            breed = {
+                "path": breed_path,
+                **parse_breed_file(read_text(gamelogic_zip, breed_path)),
+            }
+            resolved_breed_count += 1
+
+        cost = declaration.get("cost") if declaration else None
+        member_cost = cost * count if cost is not None else None
+        if member_cost is not None:
+            total_cost += member_cost
+
+        role_class = declaration.get("role_class") if declaration else None
+        cp_source = "infantry_declaration" if role_class else None
+        if role_class is None:
+            role_class = INFANTRY_ROLE_CLASS_FALLBACKS.get(alias)
+            if role_class:
+                cp_source = "current_version_alias_fallback"
+
+        command_points_each = infantry_role_cp.get(role_class) if role_class else None
+        member_command_points = (
+            command_points_each * count if command_points_each is not None else None
+        )
+        if member_command_points is None:
+            all_command_points_known = False
+        else:
+            total_command_points += member_command_points
+
+        details.append(
+            {
+                "alias": alias,
+                "count": count,
+                "slot": member["slot"],
+                "declaration": declaration,
+                "breed_file": breed,
+                "total_cost": member_cost,
+                "command_point_role_class": role_class,
+                "command_points_source": cp_source,
+                "command_points_each": command_points_each,
+                "total_command_points": member_command_points,
+            }
+        )
+
+    if unit["cp"] is not None:
+        unit["cp_source"] = "unit_definition"
+    elif details and all_command_points_known:
+        unit["cp"] = (
+            int(total_command_points)
+            if total_command_points.is_integer()
+            else total_command_points
+        )
+        unit["cp_source"] = "summed_member_role_classes"
+
+    return details, total_cost, resolved_breed_count
+
+
 def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) -> None:
+    """Export every faction tree and its images into ``output_dir``."""
     game_resource_dir = game_resource_dir.resolve()
     output_dir = output_dir.resolve()
-    archives = {
-        name: game_resource_dir / relative_path
-        for name, relative_path in REQUIRED_GAME_FILES.items()
-    }
-    gamelogic_pak = archives["gamelogic"]
-    interface_scene_pak = archives["interface_scene"]
-    interface_pages_pak = archives["interface_pages"]
-    required_archives = list(archives.values())
+    archives = ArchivePaths.from_game_directory(game_resource_dir)
+    required_archives = archives.all()
     missing_archives = [str(path) for path in required_archives if not path.is_file()]
     if missing_archives:
         raise FileNotFoundError(f"Required archive(s) not found: {', '.join(missing_archives)}")
@@ -428,23 +571,21 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
     log(f"Game resource directory: {game_resource_dir}", quiet=quiet)
     log(f"Output directory: {output_dir}", quiet=quiet)
     for archive in required_archives:
-        log(f"Using {archive.relative_to(game_resource_dir)} ({archive.stat().st_size / (1024 * 1024):.1f} MiB)", quiet=quiet)
+        size_mib = archive.stat().st_size / (1024 * 1024)
+        log(
+            f"Using {archive.relative_to(game_resource_dir)} ({size_mib:.1f} MiB)",
+            quiet=quiet,
+        )
 
     if output_dir == game_resource_dir or output_dir == SCRIPT_DIR:
         raise RuntimeError("Output directory must not be the game resource or script directory")
-    if output_dir.exists():
-        existing_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
-        log(
-            f"Removing existing output directory {output_dir} ({existing_files} files) so all output is replaced",
-            quiet=quiet,
-        )
-        shutil.rmtree(output_dir)
-    else:
-        log(f"Creating output directory {output_dir}", quiet=quiet)
-    images_dir = output_dir / "images"
-    images_dir.mkdir(parents=True, exist_ok=True)
+    replace_output_directory(output_dir, quiet=quiet)
 
-    with ZipFile(gamelogic_pak) as gamelogic_zip, ZipFile(interface_scene_pak) as scene_zip, ZipFile(interface_pages_pak) as pages_zip:
+    with (
+        ZipFile(archives.game_logic) as gamelogic_zip,
+        ZipFile(archives.interface_scene) as scene_zip,
+        ZipFile(archives.interface_pages) as pages_zip,
+    ):
         scene_names = set(scene_zip.namelist())
         pages_names = set(pages_zip.namelist())
         gamelogic_names = set(gamelogic_zip.namelist())
@@ -460,12 +601,17 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
         log(f"Discovered {len(factions)} factions: {', '.join(factions)}", quiet=quiet)
 
         if CONQUEST_INF_SETTINGS_PATH not in gamelogic_names:
-            raise RuntimeError(f"Required infantry settings not found: {CONQUEST_INF_SETTINGS_PATH}")
+            raise RuntimeError(
+                f"Required infantry settings not found: {CONQUEST_INF_SETTINGS_PATH}"
+            )
         infantry_role_cp = parse_infantry_role_command_points(
             read_text(gamelogic_zip, CONQUEST_INF_SETTINGS_PATH)
         )
         if not infantry_role_cp:
-            raise RuntimeError(f"No infantry command-point values parsed from {CONQUEST_INF_SETTINGS_PATH}")
+            raise RuntimeError(
+                "No infantry command-point values parsed from "
+                f"{CONQUEST_INF_SETTINGS_PATH}"
+            )
         log(
             f"Parsed command-point values for {len(infantry_role_cp)} infantry role classes",
             quiet=quiet,
@@ -508,9 +654,9 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
                     "roster_unit_file": roster_unit_path,
                     "infantry_settings_file": CONQUEST_INF_SETTINGS_PATH,
                     "archives": [
-                        gamelogic_pak.name,
-                        interface_scene_pak.name,
-                        interface_pages_pak.name,
+                        archives.game_logic.name,
+                        archives.interface_scene.name,
+                        archives.interface_pages.name,
                     ],
                 },
                 "nodes": [],
@@ -535,63 +681,15 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
 
                 member_details = []
                 total_member_cost = 0.0
-                total_member_cp = 0.0
-                member_cp_complete = True
                 if unit_info:
-                    for member in unit_info["members"]:
-                        declaration = breed_declarations.get(member["alias"])
-                        breed_file_details = {}
-                        breed_path = resolve_breed_path(member["alias"], unit_info["side"], unit_info["period"], breed_paths)
-                        if breed_path:
-                            breed_file_details = parse_breed_file(read_text(gamelogic_zip, breed_path))
-                            resolved_breeds += 1
-
-                        member_cost = None
-                        if declaration and declaration.get("cost") is not None:
-                            member_cost = declaration["cost"] * member["count"]
-                            total_member_cost += member_cost
-
-                        member_cp = None
-                        member_cp_total = None
-                        member_role_class = declaration.get("role_class") if declaration else None
-                        member_cp_source = "infantry_declaration" if member_role_class else None
-                        if member_role_class is None:
-                            member_role_class = INFANTRY_ROLE_CLASS_FALLBACKS.get(member["alias"])
-                            if member_role_class:
-                                member_cp_source = "current_version_alias_fallback"
-                        if member_role_class:
-                            member_cp = infantry_role_cp.get(member_role_class)
-                        if member_cp is not None:
-                            member_cp_total = member_cp * member["count"]
-                            total_member_cp += member_cp_total
-                        else:
-                            member_cp_complete = False
-
-                        member_details.append(
-                            {
-                                "alias": member["alias"],
-                                "count": member["count"],
-                                "slot": member["slot"],
-                                "declaration": declaration,
-                                "breed_file": {
-                                    "path": breed_path,
-                                    **breed_file_details,
-                                }
-                                if breed_path
-                                else None,
-                                "total_cost": member_cost,
-                                "command_point_role_class": member_role_class,
-                                "command_points_source": member_cp_source,
-                                "command_points_each": member_cp,
-                                "total_command_points": member_cp_total,
-                            }
-                        )
-
-                    if unit_info["cp"] is None and member_details and member_cp_complete:
-                        unit_info["cp"] = int(total_member_cp) if total_member_cp.is_integer() else total_member_cp
-                        unit_info["cp_source"] = "summed_member_role_classes"
-                    elif unit_info["cp"] is not None:
-                        unit_info["cp_source"] = "unit_definition"
+                    member_details, total_member_cost, breed_count = describe_unit_members(
+                        unit_info,
+                        breed_declarations,
+                        breed_paths,
+                        infantry_role_cp,
+                        gamelogic_zip,
+                    )
+                    resolved_breeds += breed_count
 
                 image_source, image_bytes = choose_image(
                     scene_zip,
@@ -605,7 +703,8 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
                 image_ref = None
                 if image_source and image_bytes:
                     ext = Path(image_source).suffix
-                    relative_path = Path("images") / faction / f"{sanitize_filename(entry['id'])}{ext}"
+                    filename = f"{sanitize_filename(entry['id'])}{ext}"
+                    relative_path = Path("images") / faction / filename
                     target = output_dir / relative_path
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(image_bytes)
@@ -639,7 +738,13 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
                     }
                 )
 
-            out["nodes"].sort(key=lambda node: (node["position"]["y"], node["position"]["x"], node["id"]))
+            out["nodes"].sort(
+                key=lambda node: (
+                    node["position"]["y"],
+                    node["position"]["x"],
+                    node["id"],
+                )
+            )
             json_path = output_dir / f"{faction}.json"
             json_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
             total_nodes += len(entries)
@@ -651,7 +756,10 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
                 quiet=quiet,
             )
             if missing_unit_ids:
-                log(f"  WARNING: unit definitions not found: {', '.join(missing_unit_ids)}", quiet=quiet)
+                log(
+                    f"  WARNING: unit definitions not found: {', '.join(missing_unit_ids)}",
+                    quiet=quiet,
+                )
             if missing_image_ids:
                 log(f"  WARNING: images not found: {', '.join(missing_image_ids)}", quiet=quiet)
             log(f"  Wrote {json_path} ({json_path.stat().st_size:,} bytes)", quiet=quiet)
@@ -675,7 +783,10 @@ def parse_args() -> object:
     parser.add_argument(
         "game_path",
         type=Path,
-        help="required path to the game's resource directory (the directory containing gamelogic.pak)",
+        help=(
+            "required path to the game's resource directory "
+            "(the directory containing gamelogic.pak)"
+        ),
     )
     parser.add_argument(
         "--output",

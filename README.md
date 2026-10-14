@@ -1,1 +1,114 @@
-# GatesOfHellResearchTree
+# Gates of Hell Research Tree
+
+Generate a searchable, interactive HTML version of the dynamic-conquest research
+trees from an installed copy of **Call to Arms: Gates of Hell — Ostfront**.
+
+The project reads the game's own archives, so unit names, research links, images,
+and statistics come from the installed game version instead of a separately
+maintained database.
+
+## Features
+
+- Navigable research graph for every detected faction
+- Localized in-game unit names and infantry levels
+- Unit portraits and icons extracted from the game archives
+- Prerequisite highlighting and total research-point calculation
+- Light and dark themes
+- Filters for unit class, squad size, level, command points, reload time, armor,
+  gun caliber, infantry anti-tank weapons, and shovels
+- Detailed unit, member, weapon, and equipment statistics
+- A self-contained `index.html` that works without a web server
+
+## Requirements
+
+- Python 3.10 or newer
+- [Pillow](https://pypi.org/project/pillow/) for converting game images
+- An installed copy of Call to Arms: Gates of Hell — Ostfront
+
+Install Pillow with:
+
+```bash
+python3 -m pip install Pillow
+```
+
+## Quick start
+
+The scripts require the path to the game's `resource` directory. A typical Linux
+Steam installation uses:
+
+```text
+~/.local/share/Steam/steamapps/common/Call to Arms - Gates of Hell/resource
+```
+
+First export the game data:
+
+```bash
+./export_research_trees.py \
+  "$HOME/.local/share/Steam/steamapps/common/Call to Arms - Gates of Hell/resource"
+```
+
+Then build the HTML viewer:
+
+```bash
+./create_research_tree_html.py \
+  "$HOME/.local/share/Steam/steamapps/common/Call to Arms - Gates of Hell/resource"
+```
+
+Open `research_tree_html/index.html` in a browser.
+
+Both output directories are replaced on every run. Use `--output` or `--input`
+to select different locations:
+
+```bash
+./export_research_trees.py GAME_PATH --output /tmp/research_export
+./create_research_tree_html.py GAME_PATH \
+  --input /tmp/research_export \
+  --output /tmp/research_tree_html
+```
+
+Run either script with `--help` for the complete command-line reference.
+
+## How it works
+
+The process is intentionally split into two stages:
+
+1. `export_research_trees.py` reads research, roster, breed, and interface
+   archives. It writes one JSON file per faction plus the corresponding images.
+2. `create_research_tree_html.py` enriches that export with localization,
+   vehicle armor, weapon, reload, and equipment data. It converts images to PNG
+   and embeds all faction data in one HTML file.
+
+The generated directories are ignored by Git because they contain extracted game
+data and can always be rebuilt locally.
+
+## Game-data notes
+
+The game uses a custom text format rather than a formal public schema. Parsers in
+this project deliberately extract only the fields needed by the viewer.
+
+Infantry command points are calculated from the role class of every squad member.
+Vehicles and formations retain their explicit command-point values. A small,
+documented compatibility table handles four aliases referenced by the current
+rosters but omitted from their declaration files.
+
+Some research nodes may not have a normal unit definition. The exporter reports
+these cases and keeps the nodes in the graph when their research data and images
+are available.
+
+## Repository layout
+
+```text
+export_research_trees.py       Extract game data and images
+create_research_tree_html.py   Enrich the export and build the viewer
+research_export/               Generated intermediate data (ignored)
+research_tree_html/            Generated website (ignored)
+```
+
+## Contributing
+
+When changing a parser, test against a current unmodified game installation and
+run both stages end to end. Please avoid committing generated game data or assets.
+
+This is an unofficial community project and is not affiliated with Barbedwire
+Studios or Digitalmindsoft. Game names and assets belong to their respective
+owners.

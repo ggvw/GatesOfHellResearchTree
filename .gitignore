@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated from locally installed game archives.
+research_export/
+research_tree_html/
