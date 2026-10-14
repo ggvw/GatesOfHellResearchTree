@@ -23,7 +23,8 @@ maintained database.
 - Detailed unit, member, weapon, and equipment statistics
 - A self-contained `index.html` that works without a web server
 
-- <img width="1570" height="821" alt="image" src="https://github.com/user-attachments/assets/e8e6c644-e0d2-491c-b37f-28a30ae26ccd" />
+- <img width="3398" height="1792" alt="image" src="https://github.com/user-attachments/assets/e91c1430-c3c8-4651-b033-a6432773b906" />
+
 
 
 ## Using the filters
