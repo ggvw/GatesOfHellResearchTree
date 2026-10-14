@@ -19,6 +19,10 @@ maintained database.
 - Detailed unit, member, weapon, and equipment statistics
 - A self-contained `index.html` that works without a web server
 
+<img width="1027" height="763" alt="image" src="https://github.com/user-attachments/assets/0a515978-f84b-488f-a179-f81157d3a820" target="_blank" />
+
+
+
 ## Requirements
 
 - Python 3.10 or newer
