@@ -14,10 +14,61 @@ maintained database.
 - Unit portraits and icons extracted from the game archives
 - Prerequisite highlighting and total research-point calculation
 - Light and dark themes
-- Filters for unit class, squad size, level, command points, reload time, armor,
-  gun caliber, infantry anti-tank weapons, and shovels
+- A collapsible filter panel with squad size, level, command-point, reload-time,
+  armor, gun-caliber, and infantry-equipment filters
+- Multiselect filters for infantry inventory, weapon roles, and specialist types
+- Research-branch multiselect for infantry, support-weapon, and vehicle branches;
+  selected branches retain shared prerequisites and collapse empty graph rows
 - Detailed unit, member, weapon, and equipment statistics
 - A self-contained `index.html` that works without a web server
+
+## Using the filters
+
+The collapsible panel on the left highlights matching nodes. Most filters leave
+the complete research tree visible for context. The research-branch filter is
+the exception: it hides unrelated branches and compacts empty graph rows.
+
+Selecting several values within one multiselect matches units containing any of
+those values. Selections from different filter groups are combined, so a unit
+must satisfy every active group.
+
+### Infantry inventory
+
+Inventory names differ between factions. The generator therefore maps the
+game's internal item IDs to the following cross-faction categories:
+
+- Shovel
+- Binoculars
+- Mine detector
+- Wire cutters
+- Pickaxe
+- Demolition charge
+- Anti-tank grenade
+- Anti-personnel grenade
+- Anti-personnel mine
+- Anti-tank mine
+- Smoke grenade
+- Incendiary or white-phosphorus item
+- Molotov cocktail
+- Body armour
+- Radio
+- Flare gun
+- Knife or bayonet
+
+The grenade classifications come directly from the game's anti-tank and
+anti-personnel grenade directories. Smoke and incendiary grenades remain
+separate categories. Ordinary weapons and ammunition are intentionally omitted
+from Inventory because they are represented by the Weapon roles filter.
+
+### Weapon roles and specialists
+
+Weapon roles are derived from each soldier breed's icon, producing options such
+as rifle, submachine gun, automatic rifle, machine gun, AT launcher, AT rifle,
+flamethrower, sniper rifle, and rifle grenade. Specialist types use role classes,
+perks, and narrowly scoped aliases to identify scouts/recon troops, snipers,
+scoped marksmen, engineers, medics, officers, tank crews, repair specialists,
+and radio operators. Only values present in the generated research data are
+shown in each multiselect.
 
 ## Requirements
 
@@ -94,6 +145,11 @@ rosters but omitted from their declaration files.
 Some research nodes may not have a normal unit definition. The exporter reports
 these cases and keeps the nodes in the graph when their research data and images
 are available.
+
+Research branch types are derived from the section surrounding each root in the
+game's research files. Descendants retain every applicable root type because the
+game contains cross-branch prerequisites. The `conquest_blank` placeholders are
+deliberately excluded.
 
 ## Repository layout
 

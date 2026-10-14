@@ -143,11 +143,20 @@ def parse_token_map(text: str) -> dict[str, list[str]]:
 def parse_research_entries(text: str) -> list[dict]:
     """Parse the compact research-node records from a faction research file."""
     entries = []
+    section_pattern = re.compile(r"^;\/\/---(.+?)---\s*$", re.MULTILINE)
+    sections = [
+        (match.start(), match.group(1).strip())
+        for match in section_pattern.finditer(text)
+    ]
     pattern = re.compile(
         r'\{\s*(tech\s+)?"([^"]+)"\s*requires\s*"([^"]*)"'
         r"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+)\s+(-?\d+)\s*\}"
     )
     for match in pattern.finditer(text):
+        research_section = next(
+            (name for position, name in reversed(sections) if position < match.start()),
+            None,
+        )
         entries.append(
             {
                 "id": match.group(2),
@@ -155,6 +164,7 @@ def parse_research_entries(text: str) -> list[dict]:
                 "requires": [item for item in match.group(3).split() if item],
                 "cost": float(match.group(4)),
                 "position": {"x": int(match.group(5)), "y": int(match.group(6))},
+                "research_section": research_section,
             }
         )
     return entries
