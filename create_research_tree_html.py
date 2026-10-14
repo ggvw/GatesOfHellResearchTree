@@ -369,6 +369,28 @@ def _named_parenthesized_blocks(text: str, prefix: str) -> dict[str, str]:
     return blocks
 
 
+def vehicle_speed(definition_text: str) -> float | None:
+    """Return road speed in km/h from the first vehicle mobility block."""
+    # Parentheses in semicolon comments are prose, not part of the game syntax.
+    definition_text = re.sub(r";[^\r\n]*", "", definition_text)
+    for match in re.finditer(r'\("mobility_[^"]+"', definition_text):
+        depth = 0
+        for index in range(match.start(), len(definition_text)):
+            if definition_text[index] == "(":
+                depth += 1
+            elif definition_text[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    block = definition_text[match.start() : index + 1]
+                    speed_match = re.search(
+                        r"\bspeed\s*\(\s*([0-9.]+)\s*\)", block, re.IGNORECASE
+                    )
+                    if speed_match:
+                        return float(speed_match.group(1))
+                    break
+    return None
+
+
 def armor_thickness(definition_text: str) -> tuple[float | None, float | None]:
     """Return the best front-armor estimate and maximum armor value."""
     front = [
@@ -567,7 +589,7 @@ def annotate_infantry_capabilities(
 
 def annotate_unit_metadata(
     trees: list[dict], vehicle_archive: Path, gamelogic_archive: Path
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Add indirect fire, primary reload time, and broad unit class metadata."""
     if not vehicle_archive.is_file():
         raise RuntimeError(f"Vehicle archive not found: {vehicle_archive}")
@@ -583,6 +605,7 @@ def annotate_unit_metadata(
     reload_count = 0
     armor_count = 0
     caliber_count = 0
+    speed_count = 0
     with ZipFile(vehicle_archive) as archive, ZipFile(gamelogic_archive) as gamelogic:
         archive_names = set(archive.namelist())
         definitions: dict[str, list[str]] = defaultdict(list)
@@ -720,6 +743,10 @@ def annotate_unit_metadata(
                 if node["main_gun_caliber_mm"] is not None:
                     caliber_count += 1
 
+                node["vehicle_speed_kmh"] = vehicle_speed(definition_text)
+                if node["vehicle_speed_kmh"] is not None:
+                    speed_count += 1
+
                 (
                     node["front_armor_thickness_mm"],
                     node["maximum_armor_thickness_mm"],
@@ -747,7 +774,7 @@ def annotate_unit_metadata(
                     anti_personnel_grenades,
                 )
 
-    return indirect_count, reload_count, armor_count, caliber_count
+    return indirect_count, reload_count, armor_count, caliber_count, speed_count
 
 
 def convert_images(trees: list[dict], input_dir: Path, output_dir: Path) -> tuple[int, list[str]]:
@@ -870,10 +897,14 @@ def main() -> None:
         f"Resolved {localized_name_count} in-game unit names and "
         f"{localized_level_count} localized unit levels"
     )
-    indirect_count, reload_count, armor_count, caliber_count = annotate_unit_metadata(
-        trees,
-        game_files.vehicle_archive,
-        game_files.game_logic_archive,
+    (
+        indirect_count,
+        reload_count,
+        armor_count,
+        caliber_count,
+        speed_count,
+    ) = annotate_unit_metadata(
+        trees, game_files.vehicle_archive, game_files.game_logic_archive
     )
     log(
         f"Detected indirect-fire capability on {indirect_count} research nodes "
@@ -882,6 +913,7 @@ def main() -> None:
     log(f"Resolved primary-weapon reload time for {reload_count} research nodes")
     log(f"Resolved frontal armor thickness for {armor_count} research nodes")
     log(f"Resolved main-gun caliber for {caliber_count} research nodes")
+    log(f"Resolved vehicle road speed for {speed_count} research nodes")
     if output_dir.exists():
         old_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
         log(f"Removing existing {output_dir} ({old_files} files)")
@@ -1042,6 +1074,13 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 <aside id="filter-panel">
   <h2 class="filter-heading">Highlight filters</h2>
   <fieldset class="filter-group">
+    <legend>Research branches</legend>
+    <details class="multi-filter" id="branch-filter">
+      <summary id="branch-summary">Research branches: All</summary>
+      <div class="multi-options" id="branch-options" role="group" aria-label="Research branches"></div>
+    </details>
+  </fieldset>
+  <fieldset class="filter-group">
     <legend>General</legend>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
@@ -1066,15 +1105,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   </fieldset>
   <fieldset class="filter-group">
     <legend>Vehicles and guns</legend>
+    <label>Min vehicle speed (km/h) <input id="min-vehicle-speed" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Min front armour (mm) <input id="min-front-armor" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
-  </fieldset>
-  <fieldset class="filter-group">
-    <legend>Research branches</legend>
-    <details class="multi-filter" id="branch-filter">
-      <summary id="branch-summary">Research branches: All</summary>
-      <div class="multi-options" id="branch-options" role="group" aria-label="Research branches"></div>
-    </details>
+    <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
   </fieldset>
   <button id="clear-filters">Clear filters</button>
   <div id="filter-count"></div>
@@ -1097,10 +1131,12 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const minSizeInput = document.getElementById('min-size');
   const minLevelInput = document.getElementById('min-level');
   const minInfantryAtInput = document.getElementById('min-infantry-at');
+  const minVehicleSpeedInput = document.getElementById('min-vehicle-speed');
   const minFrontArmorInput = document.getElementById('min-front-armor');
   const minCaliberInput = document.getElementById('min-caliber');
   const maxReloadInput = document.getElementById('max-reload');
   const maxCpInput = document.getElementById('max-cp');
+  const hasIndirectFireInput = document.getElementById('has-indirect-fire');
   const inventoryOptions = document.getElementById('inventory-options');
   const inventorySummary = document.getElementById('inventory-summary');
   const weaponRoleOptions = document.getElementById('weapon-role-options');
@@ -1342,17 +1378,20 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const hasMinSize = minSizeInput.value !== '';
     const hasMinLevel = minLevelInput.value !== '';
     const hasMinInfantryAt = minInfantryAtInput.value !== '';
+    const hasMinVehicleSpeed = minVehicleSpeedInput.value !== '';
     const hasMinFrontArmor = minFrontArmorInput.value !== '';
     const hasMinCaliber = minCaliberInput.value !== '';
     const hasMaxReload = maxReloadInput.value !== '';
     const hasMaxCp = maxCpInput.value !== '';
+    const indirectFireOnly = hasIndirectFireInput.checked;
     const selectedInventory = selectedValues(inventoryOptions);
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || selectedInventory.size || selectedWeaponRoles.size || selectedSpecialists.size;
+    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinVehicleSpeed || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedSpecialists.size;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
+    const minVehicleSpeed = Number(minVehicleSpeedInput.value);
     const minFrontArmor = Number(minFrontArmorInput.value);
     const minCaliber = Number(minCaliberInput.value);
     const maxReload = Number(maxReloadInput.value);
@@ -1363,6 +1402,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       const unitSize = node.stats?.unit_count;
       const unitLevel = node.unit_level;
       const infantryAt = node.anti_tank_weapon_count;
+      const vehicleSpeed = node.vehicle_speed_kmh;
       const frontArmor = node.front_armor_thickness_mm;
       const caliber = node.main_gun_caliber_mm;
       const reload = node.reload_time;
@@ -1371,10 +1411,12 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!hasMinSize || (unitSize !== null && unitSize !== undefined && unitSize >= minSize))
         && (!hasMinLevel || (unitLevel !== null && unitLevel !== undefined && unitLevel >= minLevel))
         && (!hasMinInfantryAt || (node.unit_class === 'infantry' && infantryAt >= minInfantryAt))
+        && (!hasMinVehicleSpeed || (vehicleSpeed !== null && vehicleSpeed !== undefined && vehicleSpeed >= minVehicleSpeed))
         && (!hasMinFrontArmor || (frontArmor !== null && frontArmor !== undefined && frontArmor >= minFrontArmor))
         && (!hasMinCaliber || (caliber !== null && caliber !== undefined && caliber >= minCaliber))
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
+        && (!indirectFireOnly || node.indirect_fire)
         && (!selectedInventory.size || (node.inventory_types || []).some(type => selectedInventory.has(type)))
         && (!selectedWeaponRoles.size || (node.weapon_roles || []).some(role => selectedWeaponRoles.has(role)))
         && (!selectedSpecialists.size || (node.specialist_types || []).some(type => selectedSpecialists.has(type)));
@@ -1469,7 +1511,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
       <h3>Unlock prerequisites (${required.size})</h3>${requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>'}
       <h3>Research data</h3>${statRows({cost: node.cost, indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', position_x: node.position.x, position_y: node.position.y, source_asset: node.image?.source_asset})}
-      <h3>Aggregate unit stats</h3>${statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time})}
+      <h3>Aggregate unit stats</h3>${statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time})}
       <h3>Unit stats</h3>${statRows(unit, new Set(['raw', 'members', 'id']))}
       ${memberHtml ? `<h3>Unit members (${node.members.length})</h3>${memberHtml}` : ''}`;
   }
@@ -1540,7 +1582,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     event.currentTarget.setAttribute('aria-expanded', String(!collapsed));
     setTimeout(fitTree, 210);
   });
-  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput];
+  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minVehicleSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput, hasIndirectFireInput];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
@@ -1550,7 +1592,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
   branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); fitTree(); });
   document.getElementById('clear-filters').addEventListener('click', () => {
-    for (const input of [minSizeInput, minLevelInput, minInfantryAtInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput]) input.value = '';
+    for (const input of [minSizeInput, minLevelInput, minInfantryAtInput, minVehicleSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput]) input.value = '';
+    hasIndirectFireInput.checked = false;
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
     updateFilterSummaries(); applyFilters(); fitTree();
   });

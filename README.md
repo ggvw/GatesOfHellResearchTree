@@ -15,7 +15,8 @@ maintained database.
 - Prerequisite highlighting and total research-point calculation
 - Light and dark themes
 - A collapsible filter panel with squad size, level, command-point, reload-time,
-  armor, gun-caliber, and infantry-equipment filters
+  vehicle-speed, armor, gun-caliber, indirect-fire, and infantry-equipment
+  filters
 - Multiselect filters for infantry inventory, weapon roles, and specialist types
 - Research-branch multiselect for infantry, support-weapon, and vehicle branches;
   selected branches retain shared prerequisites and collapse empty graph rows
@@ -129,8 +130,8 @@ The process is intentionally split into two stages:
 1. `export_research_trees.py` reads research, roster, breed, and interface
    archives. It writes one JSON file per faction plus the corresponding images.
 2. `create_research_tree_html.py` enriches that export with localization,
-   vehicle armor, weapon, reload, and equipment data. It converts images to PNG
-   and embeds all faction data in one HTML file.
+   vehicle armor and road speed, weapon, reload, indirect-fire, and equipment
+   data. It converts images to PNG and embeds all faction data in one HTML file.
 
 The generated directories are ignored by Git because they contain extracted game
 data and can always be rebuilt locally.
