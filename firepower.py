@@ -64,53 +64,75 @@ def firepower_group(node: dict) -> str:
     return "Other armed vehicles"
 
 
+def summarize_weapons(weapons: list[tuple[dict, int]], cp: float | None) -> dict:
+    """Combine quantities within one weapon slot, never across weapon slots."""
+    profiles = [(weapon_firepower(weapon), count) for weapon, count in weapons]
+    metrics = dict.fromkeys(METRIC_KEYS)
+    if profiles:
+        for key in ("burst_rounds_5s", "sustained_rpm", "caliber_weighted_rpm"):
+            if all(profile[key] is not None for profile, _ in profiles):
+                metrics[key] = sum(profile[key] * count for profile, count in profiles)
+        if all(profile["firing_endurance_seconds"] is not None for profile, _ in profiles):
+            metrics["firing_endurance_seconds"] = min(
+                profile["firing_endurance_seconds"] for profile, _ in profiles
+            )
+        if cp is not None and cp > 0 and metrics["sustained_rpm"] is not None:
+            metrics["rounds_per_minute_per_cp"] = metrics["sustained_rpm"] / cp
+    metrics["weapon_count"] = sum(count for _, count in weapons)
+    metrics["weapons"] = [
+        {"name": weapon.get("display_name") or weapon.get("id") or "Unknown weapon", "count": count}
+        for weapon, count in weapons
+    ]
+    metrics["percentiles"] = {}
+    return metrics
+
+
 def annotate_firepower(trees: list[dict]) -> None:
-    """Sum infantry main weapons or mounted guns, without double-counting crews."""
+    """Keep primary, secondary and additional weapon output separate."""
     for tree in trees:
         cohorts = defaultdict(list)
         for node in tree["nodes"]:
-            profiles = []
+            slots = {"primary": [], "secondary": []}
+            other_weapons = defaultdict(list)
             if node.get("vehicle_weapons"):
-                profiles = [
-                    (weapon_firepower(weapon), weapon.get("mount_count", 1))
-                    for weapon in node["vehicle_weapons"]
-                ]
+                for index, weapon in enumerate(node["vehicle_weapons"]):
+                    entry = (weapon, weapon.get("mount_count", 1))
+                    if index < 2:
+                        slots[("primary", "secondary")[index]].append(entry)
+                    else:
+                        other_weapons[index].append(entry)
             elif node.get("unit_class") == "infantry" and not (node.get("unit") or {}).get("vehicle"):
                 for member in node.get("members") or []:
                     weapons = member.get("weapons") or []
                     if member.get("count", 0) > 0:
-                        profiles.append((weapon_firepower(weapons[0] if weapons else {}), member["count"]))
+                        # An unknown main weapon must not silently lower the primary score.
+                        slots["primary"].append((weapons[0] if weapons else {}, member["count"]))
+                        if len(weapons) > 1:
+                            slots["secondary"].append((weapons[1], member["count"]))
+                        for index, weapon in enumerate(weapons[2:], start=2):
+                            identity = weapon.get("id") or weapon.get("display_name") or index
+                            other_weapons[identity].append((weapon, member["count"]))
 
-            metrics = dict.fromkeys(METRIC_KEYS)
-            if profiles:
-                for key in ("burst_rounds_5s", "sustained_rpm", "caliber_weighted_rpm"):
-                    # Missing data stays unknown instead of silently lowering a score.
-                    if all(profile[key] is not None for profile, _ in profiles):
-                        metrics[key] = sum(profile[key] * count for profile, count in profiles)
-                if all(profile["firing_endurance_seconds"] is not None for profile, _ in profiles):
-                    metrics["firing_endurance_seconds"] = min(
-                        profile["firing_endurance_seconds"] for profile, _ in profiles
-                    )
-                cp = (node.get("unit") or {}).get("cp")
-                if cp is not None and cp > 0 and metrics["sustained_rpm"] is not None:
-                    metrics["rounds_per_minute_per_cp"] = metrics["sustained_rpm"] / cp
-
-            metrics["group"] = firepower_group(node)
-            metrics["weapon_count"] = sum(count for _, count in profiles)
-            metrics["percentiles"] = {}
-            node["firepower"] = metrics
-            if profiles:
-                cohorts[metrics["group"]].append(node)
+            cp = (node.get("unit") or {}).get("cp")
+            group = firepower_group(node)
+            node["firepower"] = {"group": group, "other": [
+                summarize_weapons(weapons, cp) for weapons in other_weapons.values()
+            ]}
+            for slot, weapons in slots.items():
+                metrics = summarize_weapons(weapons, cp)
+                node["firepower"][slot] = metrics
+                if weapons:
+                    cohorts[(group, slot)].append(metrics)
 
         for cohort in cohorts.values():
             for key in METRIC_KEYS:
-                values = sorted(node["firepower"][key] for node in cohort if node["firepower"][key] is not None)
-                for node in cohort:
-                    value = node["firepower"][key]
+                values = sorted(metrics[key] for metrics in cohort if metrics[key] is not None)
+                for metrics in cohort:
+                    value = metrics[key]
                     if value is None:
                         continue
                     # Ties share the middle rank; a one-unit cohort has rank 50.
                     less = sum(other < value for other in values)
                     equal = values.count(value)
                     rank = 50 if len(values) == 1 else 100 * (less + (equal - 1) / 2) / (len(values) - 1)
-                    node["firepower"]["percentiles"][key] = round(rank, 1)
+                    metrics["percentiles"][key] = round(rank, 1)

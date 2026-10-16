@@ -77,9 +77,16 @@ limitations. Hover over metric labels for a short explanation.
 | Calibre-weighted output | Sustained output weighted linearly by calibre / 7.62 mm | Comparing similar guns; not a penetration or damage estimate |
 | Firing endurance | Time until the earliest included weapon empties its first magazine | Identifying firing windows and reload gaps; longer is not always better |
 
-Infantry estimates sum main weapons using each soldier's quantity. Vehicle
-estimates sum mounted guns, including repeated mounts of a gun type, and exclude
-crew sidearms. They assume fully loaded weapons, simultaneous firing, and
+Primary and secondary weapons have separate stats and minimum-value filters;
+their output is never added together. Infantry estimates sum soldiers' first
+weapons as primary and second weapons as secondary, using each soldier's quantity.
+These are alternative firing options, not simultaneous fire. Vehicles use the
+main gun as primary and the next mounted gun type as secondary, including repeated
+mounts of the same type but excluding crew sidearms. Additional weapon types have
+their own stats. Thrown grenades are excluded. For example, the Valentine Mk.XI
+shows 1 primary-gun round and 63 secondary-machine-gun rounds per 5 seconds,
+not a combined 64-round estimate. Each slot's efficiency uses the full unit CP.
+Estimates assume fully loaded weapons and
 unlimited resupply for sustained output. AI pauses, accuracy, aiming, firing
 arcs, crew conflicts, explosive damage, range, armour, and survivability are
 not modelled. Missing required inputs make the affected score Unknown.
@@ -91,10 +98,11 @@ ammunition, armour, and impact angle matter: these scores cannot determine
 anti-armour effectiveness, regardless of calibre or machine-gun output.
 
 Minimum-value filters use the raw unit estimates. Percentiles alongside the
-stats compare units within the active faction and role group; they are not
-damage percentages. Ties share a rank and single-unit groups receive 50.
+stats compare the same weapon slot within the active faction and role group;
+they are not damage percentages. Additional weapons have no percentile.
+Ties share a rank and single-unit groups receive 50.
 Zero or missing CP produces an unknown efficiency score. All active filters
-must match, and Unknown values do not match a numeric filter.
+must match, and missing weapons or Unknown values do not match a numeric filter.
 
 ### Infantry inventory
 

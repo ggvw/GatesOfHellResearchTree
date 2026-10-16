@@ -1628,18 +1628,25 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       ${firepowerDefinitions.map(metric => `<p><strong>${esc(metric.label)}:</strong> ${esc(metric.help)}</p>`).join('')}
       <h4>Calculation and limits</h4>
       <p>Let R be RPM, N be rounds before reload, and T be reload time in seconds. Shot interval = 60/R. Endurance = (N−1) × 60/R. One firing cycle = endurance + max(T, 60/R). Sustained RPM = 60 × N / cycle. Burst output counts shots from t=0 up to, but not including, t=5 seconds.</p>
-      <p>Infantry sums each soldier’s main weapon multiplied by the number of soldiers. Sidearms, extra launchers, and thrown grenades are excluded because a soldier cannot fire them simultaneously. Vehicles sum mounted guns, including repeated mounts of the same type; crew personal weapons are excluded. This assumes all included guns can fire at once and ignores firing arcs and crew conflicts.</p>
+      <p>Primary and secondary output are always separate. Vehicles use the main gun and the next mounted gun type respectively; identical mounts of a type retain their quantity. Crew personal weapons are excluded. Infantry sums soldiers’ first weapons as primary and their second weapons as secondary, using soldier quantities. Additional weapons are listed separately by type; thrown grenades are excluded. Infantry primary and secondary estimates are alternatives, not simultaneous fire. Each slot’s CP efficiency uses the full unit CP.</p>
       <p>All weapons start fully loaded with unlimited resupply for the sustained estimate. AI burst pauses, aiming, accuracy, recoil, distance, stamina, armour, explosives, and survivability are not modelled. If any included weapon lacks required data, the affected unit metric is Unknown; unknown values do not match filters.</p>
-      <p>Percentiles compare each metric with the same faction’s units in the same role group. Ties share a rank; a single-unit group receives 50. A percentile is a relative ranking, not a damage percentage or a chance to win.</p>
-      <p>Filters use the raw estimates and apply to the unit’s combined firepower, rather than only its primary gun. Multiple active filters must all match. Individual RPM and rounds-before-reload filters in General still apply only to primary weapons.</p>
+      <p>Percentiles compare the same weapon slot within the same faction and role group: primary with primary, secondary with secondary. Additional weapons have no percentile. Ties share a rank; a single-unit group receives 50. A percentile is a relative ranking, not a damage percentage or a chance to win.</p>
+      <p>Primary and secondary filters apply independently to their slot’s raw estimates; their outputs are never added together. Multiple active filters must all match. A missing weapon does not match numeric filters. Individual RPM and rounds-before-reload filters in General still apply only to primary weapons.</p>
     </div>`;
   const firepowerControls = new Map();
-  for (const metric of firepowerDefinitions) {
-    const control = document.createElement('label');
-    control.title = metric.help;
-    control.innerHTML = `${esc(metric.filter)} <input id="min-firepower-${metric.key}" type="number" min="0" step="${metric.step}" placeholder="Any">`;
-    document.getElementById('firepower-controls').append(control);
-    firepowerControls.set(metric.key, control.querySelector('input'));
+  for (const slot of ['primary', 'secondary']) {
+    const section = document.createElement('details');
+    section.id = `firepower-${slot}-filters`;
+    section.open = true;
+    section.innerHTML = `<summary>${label(slot)} weapons</summary>`;
+    document.getElementById('firepower-controls').append(section);
+    for (const metric of firepowerDefinitions) {
+      const control = document.createElement('label');
+      control.title = `${label(slot)} weapons: ${metric.help}`;
+      control.innerHTML = `${esc(metric.filter)} <input id="min-firepower-${slot}-${metric.key}" type="number" min="0" step="${metric.step}" placeholder="Any">`;
+      section.append(control);
+      firepowerControls.set(`${slot}.${metric.key}`, control.querySelector('input'));
+    }
   }
   document.getElementById('firepower-filter-help-content').innerHTML = firepowerHelp;
 
@@ -1958,7 +1965,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
         && firepowerFilters.every(([key, input]) => {
-          const value = node.firepower?.[key];
+          const [slot, metric] = key.split('.');
+          const value = node.firepower?.[slot]?.[metric];
           return value !== null && value !== undefined && value >= Number(input.value);
         })
         && (!indirectFireOnly || node.indirect_fire)
@@ -2086,14 +2094,21 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function firepowerStats(node) {
-    const metrics = node.firepower || {};
-    const rows = firepowerDefinitions.map(metric => {
-      const value = metrics[metric.key];
-      const percentile = metrics.percentiles?.[metric.key];
-      return `<tr><th scope="row" title="${esc(metric.help)}">${esc(metric.label)}</th><td>${shown(value) ? `${esc(number(value))} ${esc(metric.unit)}` : 'Unknown'}</td><td>${shown(percentile) ? `${esc(number(percentile))} / 100` : '—'}</td></tr>`;
-    }).join('');
-    const content = `<p class="muted">Theoretical fire volume, not damage. Comparison group: ${esc(tree.faction.toUpperCase())} · ${esc(metrics.group || 'Unknown')}. Includes ${esc(metrics.weapon_count || 0)} weapons.</p>
-      <div class="comparison-scroll" tabindex="0" role="region" aria-label="Firepower metrics"><table class="comparison"><thead><tr><th scope="col">Metric</th><th scope="col">Estimate</th><th scope="col">Group percentile</th></tr></thead><tbody>${rows}</tbody></table></div>
+    const firepower = node.firepower || {};
+    function weaponTable(title, metrics = {}) {
+      if (!metrics.weapon_count) return statSection(title, '<p class="muted">No weapon listed.</p>');
+      const weapons = (metrics.weapons || []).map(weapon => `${esc(weapon.count)} × ${esc(weapon.name)}`).join(', ');
+      const rows = firepowerDefinitions.map(metric => {
+        const value = metrics[metric.key];
+        const percentile = metrics.percentiles?.[metric.key];
+        return `<tr><th scope="row" title="${esc(metric.help)}">${esc(metric.label)}</th><td>${shown(value) ? `${esc(number(value))} ${esc(metric.unit)}` : 'Unknown'}</td><td>${shown(percentile) ? `${esc(number(percentile))} / 100` : '—'}</td></tr>`;
+      }).join('');
+      return statSection(title, `<p class="muted">${weapons}</p><div class="comparison-scroll" tabindex="0" role="region" aria-label="${esc(title)} metrics"><table class="comparison"><thead><tr><th scope="col">Metric</th><th scope="col">Estimate</th><th scope="col">Slot percentile</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+    }
+    const content = `<p class="muted">Theoretical fire volume, not damage. Comparison group: ${esc(tree.faction.toUpperCase())} · ${esc(firepower.group || 'Unknown')}. Primary and secondary output are not combined.</p>
+      ${weaponTable('Primary firepower', firepower.primary)}
+      ${weaponTable('Secondary firepower', firepower.secondary)}
+      ${(firepower.other || []).map((metrics, index) => weaponTable(`Additional weapon ${index + 1} firepower`, metrics)).join('')}
       ${statSection('Firepower help and target types', firepowerHelp, false)}`;
     return statSection('Firepower', content);
   }
