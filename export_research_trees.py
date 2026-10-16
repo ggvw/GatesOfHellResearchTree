@@ -437,6 +437,7 @@ def parse_unit_block(node_id: str, block: str) -> dict:
         "bucket": token_map.get("b", [None])[0],
         "tags": token_map.get("t", [""])[0].split(),
         "cp": _maybe_number(token_map.get("cp", [None])[0]),
+        "base_command_points": _maybe_number(token_map.get("cp", [None])[0]),
         "cw": _maybe_number(token_map.get("cw", [None])[0]),
         "ci": _maybe_number(token_map.get("ci", [None])[0]),
         "cd": _maybe_number(token_map.get("cd", [None])[0]),
@@ -533,6 +534,7 @@ def describe_unit_members(
 
         command_points_each = infantry_role_cp.get(role_class) if role_class else None
         member_command_points = (
+            0 if count == 0 else
             command_points_each * count if command_points_each is not None else None
         )
         if member_command_points is None:
@@ -555,15 +557,23 @@ def describe_unit_members(
             }
         )
 
-    if unit["cp"] is not None:
-        unit["cp_source"] = "unit_definition"
-    elif details and all_command_points_known:
-        unit["cp"] = (
-            int(total_command_points)
-            if total_command_points.is_integer()
-            else total_command_points
+    # The roster CP belongs to the vehicle/object. Its content (crew or squad
+    # members) contributes additional CP, including when the object costs zero.
+    base_cp = unit.get("base_command_points", unit["cp"])
+    unit["member_command_points"] = (
+        int(total_command_points) if all_command_points_known and total_command_points.is_integer()
+        else total_command_points if all_command_points_known else None
+    )
+    if all_command_points_known and (details or base_cp is not None):
+        total_cp = (base_cp or 0) + total_command_points
+        unit["cp"] = int(total_cp) if float(total_cp).is_integer() else total_cp
+        unit["cp_source"] = (
+            "base_plus_member_role_classes" if base_cp is not None and details
+            else "summed_member_role_classes" if details else "unit_definition"
         )
-        unit["cp_source"] = "summed_member_role_classes"
+    elif details:
+        unit["cp"] = None
+        unit["cp_source"] = "unresolved_member_command_points"
 
     return details, total_cost, resolved_breed_count
 

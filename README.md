@@ -156,7 +156,9 @@ The game uses a custom text format rather than a formal public schema. Parsers i
 this project deliberately extract only the fields needed by the viewer.
 
 Infantry command points are calculated from the role class of every squad member.
-Vehicles and formations retain their explicit command-point values. A small,
+Vehicle and object CP is added to the CP of their crew or squad members. The
+stats panel shows base, member, and total command points; a zero-CP object can
+therefore still require CP for its crew. Research-point cost is separate. A small,
 documented compatibility table handles four aliases referenced by the current
 rosters but omitted from their declaration files.
 
