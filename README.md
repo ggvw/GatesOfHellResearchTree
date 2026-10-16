@@ -28,8 +28,8 @@ maintained database.
 - Localized vehicle guns and machine guns, with calibre and reload statistics
 - Per-gun ammunition types and counts, including spare and loaded rounds
 - A self-contained `index.html` that works without a web server
+-  <img width="1157" height="795" alt="Screenshot from 2026-10-16 10-15-31" src="https://github.com/user-attachments/assets/e50a340a-5d30-4615-ba6b-6caf54439df2" />
 
-- <img width="3398" height="1792" alt="image" src="https://github.com/user-attachments/assets/e91c1430-c3c8-4651-b033-a6432773b906" />
 
 
 
