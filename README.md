@@ -17,10 +17,14 @@ maintained database.
 - A collapsible filter panel with squad size, level, command-point, reload-time,
   vehicle-speed, armor, gun-caliber, indirect-fire, and infantry-equipment
   filters
-- Multiselect filters for infantry inventory, weapon roles, and specialist types
+- Multiselect filters for infantry inventory, individual weapons, weapon roles,
+  and specialist types
 - Research-branch multiselect for infantry, support-weapon, and vehicle branches;
   selected branches retain shared prerequisites and collapse empty graph rows
 - Detailed unit, member, weapon, and equipment statistics
+- Wide, scrollable comparison tables for infantry variants and crew, with
+  vehicle statistics in a separate table and quantities shown for each variant
+- Localized main, secondary, and additional carried weapons for each soldier
 - A self-contained `index.html` that works without a web server
 
 - <img width="3398" height="1792" alt="image" src="https://github.com/user-attachments/assets/e91c1430-c3c8-4651-b033-a6432773b906" />

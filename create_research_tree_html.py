@@ -281,7 +281,7 @@ def _po_value(lines: list[str], key: str) -> str | None:
     return None
 
 
-def annotate_localized_names(trees: list[dict], localization_archive: Path) -> tuple[int, int]:
+def annotate_localized_names(trees: list[dict], localization_archive: Path) -> tuple[int, int, int]:
     """Replace internal identifiers with localized names and infantry levels."""
     if not localization_archive.is_file():
         raise RuntimeError(f"Localization archive not found: {localization_archive}")
@@ -299,8 +299,15 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
                 if context and message:
                     localized.setdefault(context, message)
 
+    # A few soldier localization keys capitalize aliases (for example Officer).
+    human_contexts = {
+        context.casefold(): context
+        for context in localized
+        if context.startswith("desc/human/")
+    }
     name_count = 0
     level_count = 0
+    member_name_count = 0
     color_tag = re.compile(r"<c\([^)]*\)>(.*?)</c>", re.IGNORECASE)
     level_prefix = re.compile(
         r"^\s*<c\([^)]*\)>\(\s*([0-9]+(?:\+)?)\s*\)</c>\s*",
@@ -309,6 +316,46 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
     for tree in trees:
         for node in tree["nodes"]:
             unit = node.get("unit") or {}
+            # The actual breed is authoritative: declaration aliases can point
+            # at a different period or nation than the soldier in this roster.
+            for member in node.get("members") or []:
+                breed_path = (member.get("breed_file") or {}).get("path")
+                declaration_id = (member.get("declaration") or {}).get("id")
+                member_contexts = []
+                if breed_path:
+                    breed_id = str(PurePosixPath(breed_path).with_suffix(""))
+                    member_contexts.append(
+                        "desc/human/" + breed_id.removeprefix("set/breed/")
+                    )
+                if declaration_id:
+                    member_contexts.append(f"desc/human/{declaration_id}")
+                context = next(
+                    (human_contexts[key.casefold()] for key in member_contexts
+                     if key.casefold() in human_contexts), None
+                )
+                member["display_name"] = member.get("alias") or "Unknown soldier"
+                member["localization_context"] = context
+                if context:
+                    member["display_name"] = color_tag.sub(
+                        lambda match: match.group(1), localized[context]
+                    ).strip()
+                    member_name_count += 1
+                for item in (member.get("breed_file") or {}).get("inventory_items") or []:
+                    item_id = re.sub(
+                        r"\s+(?:weapon|grenade)$", "", str(item.get("item") or ""),
+                        flags=re.IGNORECASE,
+                    )
+                    weapon_name = localized.get(f"desc/weapon/{item_id}")
+                    if weapon_name:
+                        item["display_name"] = color_tag.sub(
+                            lambda match: match.group(1), weapon_name
+                        ).strip()
+
+            vehicle_message = localized.get(f"desc/entity/{unit.get('vehicle')}")
+            node["vehicle_display_name"] = (
+                color_tag.sub(lambda match: match.group(1), vehicle_message).strip()
+                if vehicle_message else None
+            )
             definition_type = str(unit.get("definition_type") or "")
             node_id = node["id"]
             plain_id = re.sub(r"\([^)]+\)$", "", node_id)
@@ -349,7 +396,7 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
                 node["display_name"] = display_name
                 name_count += 1
 
-    return name_count, level_count
+    return name_count, level_count, member_name_count
 
 
 def _named_parenthesized_blocks(text: str, prefix: str) -> dict[str, str]:
@@ -440,6 +487,38 @@ def classify_unit(
     return "other"
 
 
+def annotate_member_weapons(member: dict, weapon_categories: dict[str, str]) -> None:
+    """List carried weapons, preferring the soldier's icon role as the main one."""
+    breed = member.get("breed_file") or {}
+    weapons = []
+    seen = set()
+    for item in breed.get("inventory_items") or []:
+        item_id = re.sub(
+            r"\s+weapon$", "", str(item.get("item") or ""), flags=re.IGNORECASE
+        ).lower()
+        category = weapon_categories.get(item_id)
+        if category and item_id not in seen:
+            weapons.append((item.get("display_name") or item["item"], category, item_id))
+            seen.add(item_id)
+
+    preferred_categories = {
+        "rifle": {"rifle"}, "autorifle": {"rifle", "mgun"},
+        "sniper": {"rifle"}, "riflegrenade": {"rifle"},
+        "atrifle": {"rifle"}, "smg": {"smg"}, "stg": {"smg", "rifle"},
+        "mg": {"mgun"}, "bazooka": {"bazooka"}, "flamer": {"flame"},
+        "pistol": {"pistol"},
+    }.get(breed.get("icon_id"), set())
+    main_index = next(
+        (index for index, (_, category, item_id) in enumerate(weapons)
+         if category in preferred_categories and "grenade_launcher" not in item_id), 0
+    )
+    if weapons:
+        weapons.insert(0, weapons.pop(main_index))
+    member["main_weapon"] = weapons[0][0] if weapons else None
+    member["secondary_weapon"] = weapons[1][0] if len(weapons) > 1 else None
+    member["other_weapons"] = [name for name, _, _ in weapons[2:]]
+
+
 def inventory_types(
     item_names: list[str],
     anti_tank_grenades: set[str],
@@ -510,15 +589,24 @@ def annotate_infantry_capabilities(
     node["has_scout"] = False
     node["has_sniper"] = False
     node["weapon_roles"] = []
+    node["infantry_weapons"] = []
     node["specialist_types"] = []
     node["inventory_types"] = []
     if node["unit_class"] != "infantry":
         return
 
     weapon_roles = set()
+    infantry_weapons = set()
     specialist_types = set()
     carried_inventory = set()
     for member in node.get("members") or []:
+        if int(member.get("count") or 0) > 0:
+            infantry_weapons.update(
+                weapon for weapon in [
+                    member.get("main_weapon"), member.get("secondary_weapon"),
+                    *(member.get("other_weapons") or []),
+                ] if weapon
+            )
         alias = str(member.get("alias") or "").lower()
         declaration = member.get("declaration") or {}
         breed = member.get("breed_file") or {}
@@ -581,6 +669,7 @@ def annotate_infantry_capabilities(
             node["anti_tank_weapon_count"] += int(member.get("count") or 0)
 
     node["weapon_roles"] = sorted(weapon_roles)
+    node["infantry_weapons"] = sorted(infantry_weapons)
     node["specialist_types"] = sorted(specialist_types)
     node["inventory_types"] = inventory_types(
         sorted(carried_inventory), anti_tank_grenades, anti_personnel_grenades
@@ -636,6 +725,7 @@ def annotate_unit_metadata(
             return expanded_cache[name]
 
         weapon_files: dict[str, list[str]] = defaultdict(list)
+        handheld_weapon_categories: dict[str, str] = {}
         infantry_at_hand_weapons: set[str] = set()
         anti_tank_grenades: set[str] = set()
         anti_personnel_grenades: set[str] = set()
@@ -647,6 +737,14 @@ def annotate_unit_metadata(
                 if basename.endswith(suffix):
                     basename = basename[: -len(suffix)]
             weapon_files[basename.lower()].append(name)
+            category = name.split("/")[2]
+            is_weapon_file = PurePosixPath(name).suffix in {"", ".weapon"}
+            is_handheld_category = category in {
+                "rifle", "mgun", "smg", "pistol", "bazooka", "flame"
+            }
+            is_melee_weapon = category == "melee" and basename.startswith(("knife", "bayonet"))
+            if is_weapon_file and (is_handheld_category or is_melee_weapon):
+                handheld_weapon_categories[basename.lower()] = category
             if name.startswith(("set/stuff/bazooka/", "set/stuff/grenade/anti-tank grenade/")):
                 infantry_at_hand_weapons.add(basename.lower())
             if name.startswith("set/stuff/grenade/anti-tank grenade/"):
@@ -710,6 +808,8 @@ def annotate_unit_metadata(
         for tree in trees:
             for node in tree["nodes"]:
                 unit = node.get("unit") or {}
+                for member in node.get("members") or []:
+                    annotate_member_weapons(member, handheld_weapon_categories)
                 lookup_ids = []
                 if unit.get("vehicle"):
                     lookup_ids.append(unit["vehicle"])
@@ -890,13 +990,14 @@ def main() -> None:
         f"Classified {root_count} research roots and propagated branch types "
         f"to {branch_node_count} nodes"
     )
-    localized_name_count, localized_level_count = annotate_localized_names(
+    localized_name_count, localized_level_count, member_name_count = annotate_localized_names(
         trees, game_files.localization_archive
     )
     log(
         f"Resolved {localized_name_count} in-game unit names and "
         f"{localized_level_count} localized unit levels"
     )
+    log(f"Resolved in-game names for {member_name_count} roster member entries")
     (
         indirect_count,
         reload_count,
@@ -1007,7 +1108,7 @@ body.filters-collapsed #viewport { left: 0; }
 .node.search-match { outline: 4px solid #d65cff; outline-offset: 2px; }
 .node.filter-match { background: #24563d; border-color: #73e4aa; box-shadow: 0 0 15px #50d79499; }
 .node.filter-match .node-title { background: #24563d; }
-#details { position: absolute; z-index: 10; right: 0; top: 54px; bottom: 0; width: min(430px, 42vw); background: #171b1df5; border-left: 1px solid #495154; box-shadow: -8px 0 24px #0008; overflow: auto; padding: 18px; transform: translateX(100%); transition: transform .2s; }
+#details { position: absolute; z-index: 10; right: 0; top: 54px; bottom: 0; width: min(1100px, 78vw); background: #171b1df5; border-left: 1px solid #495154; box-shadow: -8px 0 24px #0008; overflow: auto; padding: 18px; transform: translateX(100%); transition: transform .2s; }
 #details.open { transform: translateX(0); }
 #close-details { float: right; font-size: 18px; padding: 2px 8px; }
 .detail-head { display: flex; gap: 14px; align-items: flex-start; margin: 8px 0 14px; }
@@ -1021,8 +1122,14 @@ body.filters-collapsed #viewport { left: 0; }
 .stats { display: grid; grid-template-columns: minmax(105px, .8fr) minmax(0, 1.2fr); gap: 1px; background: #343b3e; border: 1px solid #343b3e; }
 .stats dt, .stats dd { margin: 0; padding: 5px 7px; background: #202527; overflow-wrap: anywhere; }
 .stats dt { color: #aeb7b9; }
-.member { border: 1px solid #3e4649; border-radius: 5px; padding: 9px; margin: 8px 0; background: #1d2224; }
-.member h4 { margin: 0 0 7px; color: #9edcff; }
+.comparison-scroll { max-width: 100%; overflow: auto; margin: 8px 0; border: 1px solid #495154; }
+.comparison { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; }
+.comparison th, .comparison td { min-width: 175px; max-width: 260px; padding: 7px 9px; vertical-align: top; text-align: left; overflow-wrap: anywhere; background: #202527; border-right: 1px solid #42494c; border-bottom: 1px solid #42494c; }
+.comparison thead th { background: #30383b; color: #9edcff; }
+.comparison th:first-child { position: sticky; left: 0; z-index: 1; min-width: 155px; width: 175px; background: #272e30; }
+.comparison .comparison-section th { position: static; background: #343e41; color: #f0c873; }
+.comparison .chips { display: block; }
+.comparison .chip { display: inline-block; margin: 0 3px 4px 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { background: #30383b; border-radius: 10px; padding: 2px 7px; font-size: 12px; }
 .notice { padding: 9px; border-left: 3px solid #db9b45; background: #3b2d1c; margin: 10px 0; }
@@ -1051,7 +1158,10 @@ html[data-theme="light"] .total strong { color: #754900; }
 html[data-theme="light"] .stats { background: #b9c3c0; border-color: #b9c3c0; }
 html[data-theme="light"] .stats dt, html[data-theme="light"] .stats dd { background: #f2f5f1; }
 html[data-theme="light"] .stats dt { color: #596466; }
-html[data-theme="light"] .member { background: #f2f5f1; border-color: #b8c1be; }
+html[data-theme="light"] .comparison-scroll { border-color: #b8c1be; }
+html[data-theme="light"] .comparison th, html[data-theme="light"] .comparison td { background: #f2f5f1; border-color: #b8c1be; }
+html[data-theme="light"] .comparison thead th, html[data-theme="light"] .comparison th:first-child { background: #e4e9e6; color: #28546a; }
+html[data-theme="light"] .comparison .comparison-section th { background: #dce3df; color: #754900; }
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
 @media (max-width: 1000px) { #hint { display: none; } }
@@ -1073,6 +1183,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 <button id="filter-toggle" title="Collapse filters" aria-label="Collapse filters" aria-expanded="true">‹</button>
 <aside id="filter-panel">
   <h2 class="filter-heading">Highlight filters</h2>
+  <button id="clear-filters">Clear filters</button>
   <fieldset class="filter-group">
     <legend>Research branches</legend>
     <details class="multi-filter" id="branch-filter">
@@ -1098,6 +1209,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <summary id="weapon-role-summary">Weapon roles: All</summary>
       <div class="multi-options" id="weapon-role-options" role="group" aria-label="Weapon roles"></div>
     </details>
+    <details class="multi-filter" id="infantry-weapon-filter">
+      <summary id="infantry-weapon-summary">Infantry weapons: All</summary>
+      <div class="multi-options" id="infantry-weapon-options" role="group" aria-label="Infantry weapons"></div>
+    </details>
     <details class="multi-filter" id="specialist-filter">
       <summary id="specialist-summary">Specialist types: All</summary>
       <div class="multi-options" id="specialist-options" role="group" aria-label="Specialist types"></div>
@@ -1110,7 +1225,6 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
   </fieldset>
-  <button id="clear-filters">Clear filters</button>
   <div id="filter-count"></div>
 </aside>
 <main id="viewport"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></main>
@@ -1141,6 +1255,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const inventorySummary = document.getElementById('inventory-summary');
   const weaponRoleOptions = document.getElementById('weapon-role-options');
   const weaponRoleSummary = document.getElementById('weapon-role-summary');
+  const infantryWeaponOptions = document.getElementById('infantry-weapon-options');
+  const infantryWeaponSummary = document.getElementById('infantry-weapon-summary');
   const specialistOptions = document.getElementById('specialist-options');
   const specialistSummary = document.getElementById('specialist-summary');
   const branchOptions = document.getElementById('branch-options');
@@ -1196,9 +1312,9 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     'radio': 'Radio', 'flare-gun': 'Flare gun', 'knife-bayonet': 'Knife / bayonet',
   };
 
-  function populateOptions(container, labels, property) {
+  function populateOptions(container, labels, property, sourceTrees = trees) {
     const available = new Set();
-    for (const item of trees) for (const node of item.nodes) {
+    for (const item of sourceTrees) for (const node of item.nodes) {
       for (const value of node[property] || []) available.add(value);
     }
     for (const [value, optionLabel] of Object.entries(labels)) {
@@ -1211,6 +1327,20 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   populateOptions(inventoryOptions, inventoryLabels, 'inventory_types');
   populateOptions(weaponRoleOptions, weaponRoleLabels, 'weapon_roles');
   populateOptions(specialistOptions, specialistLabels, 'specialist_types');
+  let infantryWeaponLabels = {};
+
+  function updateInfantryWeaponOptions() {
+    const selected = selectedValues(infantryWeaponOptions);
+    const names = [...new Set(tree.nodes.flatMap(node => node.infantry_weapons || []))]
+      .sort((a, b) => a.localeCompare(b));
+    infantryWeaponLabels = Object.fromEntries(names.map(name => [name, name]));
+    infantryWeaponOptions.replaceChildren();
+    populateOptions(infantryWeaponOptions, infantryWeaponLabels, 'infantry_weapons', [tree]);
+    for (const input of infantryWeaponOptions.querySelectorAll('input')) {
+      input.checked = selected.has(input.value);
+    }
+    updateFilterSummaries();
+  }
 
   const branchDefinitions = new Map();
   for (const item of trees) for (const node of item.nodes) {
@@ -1264,6 +1394,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function updateFilterSummaries() {
+    updateMultiSummary(infantryWeaponOptions, infantryWeaponSummary, 'Infantry weapons', infantryWeaponLabels);
     updateMultiSummary(inventoryOptions, inventorySummary, 'Inventory', inventoryLabels);
     updateMultiSummary(weaponRoleOptions, weaponRoleSummary, 'Weapon roles', weaponRoleLabels);
     updateMultiSummary(specialistOptions, specialistSummary, 'Specialist types', specialistLabels);
@@ -1276,6 +1407,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 
   function renderTree(faction) {
     tree = trees.find(item => item.faction === faction);
+    updateInfantryWeaponOptions();
     byId = new Map(tree.nodes.map(node => [node.id, node]));
     layoutPositions = new Map(
       tree.nodes.map(node => [node.id, originalNodePosition(node)])
@@ -1297,8 +1429,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         if (!required) continue;
         const rp = nodePosition(required);
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        const x1 = rp.x + NODE_W / 2, y1 = rp.y + NODE_H;
-        const x2 = p.x + NODE_W / 2, y2 = p.y;
+        const x1 = rp.x + NODE_W / 2, y1 = rp.y + NODE_H / 2;
+        const x2 = p.x + NODE_W / 2, y2 = p.y + NODE_H / 2;
         const mid = (y1 + y2) / 2;
         path.setAttribute('d', `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`);
         path.setAttribute('class', 'edge');
@@ -1359,8 +1491,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       const to = layoutPositions.get(edge.to);
       edge.element.style.display = from && to ? '' : 'none';
       if (!from || !to) continue;
-      const x1 = from.x + NODE_W / 2, y1 = from.y + NODE_H;
-      const x2 = to.x + NODE_W / 2, y2 = to.y;
+      const x1 = from.x + NODE_W / 2, y1 = from.y + NODE_H / 2;
+      const x2 = to.x + NODE_W / 2, y2 = to.y + NODE_H / 2;
       const mid = (y1 + y2) / 2;
       edge.element.setAttribute('d', `M ${x1} ${y1} C ${x1} ${mid}, ${x2} ${mid}, ${x2} ${y2}`);
     }
@@ -1386,8 +1518,9 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const indirectFireOnly = hasIndirectFireInput.checked;
     const selectedInventory = selectedValues(inventoryOptions);
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
+    const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinVehicleSpeed || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedSpecialists.size;
+    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinVehicleSpeed || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
@@ -1419,6 +1552,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!indirectFireOnly || node.indirect_fire)
         && (!selectedInventory.size || (node.inventory_types || []).some(type => selectedInventory.has(type)))
         && (!selectedWeaponRoles.size || (node.weapon_roles || []).some(role => selectedWeaponRoles.has(role)))
+        && (!selectedInfantryWeapons.size || (node.infantry_weapons || []).some(weapon => selectedInfantryWeapons.has(weapon)))
         && (!selectedSpecialists.size || (node.specialist_types || []).some(type => selectedSpecialists.has(type)));
       element.classList.toggle('filter-match', match);
       if (match) matchingIds.add(id);
@@ -1497,6 +1631,67 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     return esc(value);
   }
 
+  function comparisonTable(columns, sections) {
+    const rows = sections.map(section => {
+      const keys = [...new Set(section.values.flatMap(value => Object.keys(value || {})))];
+      const visibleKeys = keys.filter(key => !hiddenStatFields.has(key)
+        && section.values.some(value => shown(value?.[key])));
+      if (!visibleKeys.length) return '';
+      const heading = `<tr class="comparison-section"><th colspan="${columns.length + 1}">${esc(section.title)}</th></tr>`;
+      return heading + visibleKeys.map(key => `<tr><th scope="row">${esc(label(key))}</th>${section.values.map(value =>
+        `<td>${shown(value?.[key]) ? formatValue(value[key]) : '—'}</td>`
+      ).join('')}</tr>`).join('');
+    }).join('');
+    return `<div class="comparison-scroll" tabindex="0" role="region" aria-label="Unit comparison"><table class="comparison"><thead><tr><th scope="col">Statistic</th>${columns.map(name => `<th scope="col">${esc(name)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  }
+
+  function inventoryRows(member) {
+    const rows = {}, occurrences = new Map();
+    for (const item of member.breed_file?.inventory_items || []) {
+      const name = item.display_name || item.item;
+      const occurrence = (occurrences.get(name) || 0) + 1;
+      occurrences.set(name, occurrence);
+      const key = name + (occurrence > 1 ? ` (${occurrence})` : '');
+      rows[key] = shown(item.payload) ? item.payload : 'Carried';
+    }
+    return rows;
+  }
+
+  function memberTables(node) {
+    const groups = new Map();
+    for (const member of node.members || []) {
+      const role = member.declaration?.role_class || member.command_point_role_class;
+      const group = /^crew/.test(member.slot || '') || role === 'inf_tankman' ? 'Crew' : 'Infantry';
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push(member);
+    }
+    return [...groups].map(([group, members]) => {
+      const sections = [
+        {title: 'Composition', values: members.map(member => ({
+          amount_of_units: member.count, slot: member.slot,
+          command_points_each: member.command_points_each,
+          total_command_points: member.total_command_points, total_cost: member.total_cost,
+        }))},
+        {title: 'Weapons (per soldier)', values: members.map(member => ({
+          main_weapon: member.main_weapon,
+          secondary_weapon: member.secondary_weapon,
+          other_weapons: member.other_weapons,
+        }))},
+        {title: 'Soldier stats', values: members.map(member => {
+          const {raw, alias, ...stats} = member.declaration || {};
+          return stats;
+        })},
+        {title: 'Breed and abilities', values: members.map(member => {
+          const {inventory_items, ...stats} = member.breed_file || {};
+          return stats;
+        })},
+        {title: 'Inventory (per soldier)', values: members.map(inventoryRows)},
+      ];
+      const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
+      return `<h3>${esc(group)} (${count})</h3>${comparisonTable(members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections)}`;
+    }).join('');
+  }
+
   function renderDetails(node, required) {
     const allNodes = [node, ...[...required].map(id => byId.get(id)).filter(Boolean)];
     const totalCost = allNodes.reduce((sum, item) => sum + Number(item.cost || 0), 0);
@@ -1504,11 +1699,19 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     for (const item of allNodes) for (const id of item.requires) if (!byId.has(id)) missing.add(id);
     const image = node.web_image ? `<img src="${esc(node.web_image)}" alt="">` : '';
     const unit = node.unit;
-    const memberHtml = (node.members || []).map(member => {
-      const declaration = member.declaration ? statRows(member.declaration, new Set(['raw'])) : '<p class="muted">No declaration</p>';
-      const breed = member.breed_file ? statRows(member.breed_file) : '<p class="muted">No breed file</p>';
-      return `<section class="member"><h4>${esc(member.alias)} ×${esc(member.count)}</h4>${statRows({slot: member.slot, total_cost: member.total_cost})}<h4>Declaration</h4>${declaration}<h4>Breed</h4>${breed}</section>`;
-    }).join('');
+    const {raw, members, ...unitStats} = unit || {};
+    const hasVehicle = unit && (unit.vehicle || unit.definition_type?.startsWith('vehicle') || unit.definition_type?.startsWith('squad_vehicle'));
+    const unitTable = unit ? comparisonTable([hasVehicle ? (node.vehicle_display_name || node.display_name) : node.display_name], [
+      {title: 'Unit stats', values: [unitStats]},
+      ...(hasVehicle ? [{title: 'Vehicle and gun stats', values: [{
+        vehicle_speed_kmh: node.vehicle_speed_kmh,
+        indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No',
+        front_armor_thickness_mm: node.front_armor_thickness_mm,
+        maximum_armor_thickness_mm: node.maximum_armor_thickness_mm,
+        primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm,
+        reload_time_seconds: node.reload_time,
+      }]}] : []),
+    ]) : '<p class="muted">No unit definition</p>';
     const requirementNames = [...required].map(id => byId.get(id)?.display_name || id);
     detailContent.innerHTML = `
       <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
@@ -1517,8 +1720,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <h3>Unlock prerequisites (${required.size})</h3>${requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>'}
       <h3>Research data</h3>${statRows({cost: node.cost, indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'})}
       <h3>Aggregate unit stats</h3>${statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time})}
-      <h3>Unit stats</h3>${statRows(unit, new Set(['raw', 'members', 'id']))}
-      ${memberHtml ? `<h3>Unit members (${node.members.length})</h3>${memberHtml}` : ''}`;
+      <h3>${hasVehicle ? 'Vehicle / gun' : 'Formation'} stats</h3>${unitTable}
+      ${memberTables(node)}`;
   }
 
   function fitTree() {
@@ -1592,7 +1795,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
   });
-  for (const options of [inventoryOptions, weaponRoleOptions, specialistOptions]) {
+  for (const options of [inventoryOptions, weaponRoleOptions, infantryWeaponOptions, specialistOptions]) {
     options.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); });
   }
   branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); fitTree(); });
