@@ -15,16 +15,18 @@ maintained database.
 - Prerequisite highlighting and total research-point calculation
 - Light and dark themes
 - A collapsible filter panel with squad size, level, command-point, reload-time,
-  vehicle-speed, armor, gun-caliber, indirect-fire, and infantry-equipment
+  unit-speed, armor, gun-caliber, indirect-fire, and infantry-equipment
   filters
 - Multiselect filters for infantry inventory, individual weapons, weapon roles,
   and specialist types
 - Research-branch multiselect for infantry, support-weapon, and vehicle branches;
   selected branches retain shared prerequisites and collapse empty graph rows
 - Detailed unit, member, weapon, and equipment statistics
-- Wide, scrollable comparison tables for infantry variants and crew, with
+- A wide popup stats window with scrollable comparison tables for infantry and crew,
   vehicle statistics in a separate table and quantities shown for each variant
 - Localized main, secondary, and additional carried weapons for each soldier
+- Localized vehicle guns and machine guns, with calibre and reload statistics
+- Per-gun ammunition types and counts, including spare and loaded rounds
 - A self-contained `index.html` that works without a web server
 
 - <img width="3398" height="1792" alt="image" src="https://github.com/user-attachments/assets/e91c1430-c3c8-4651-b033-a6432773b906" />
@@ -40,6 +42,13 @@ the exception: it hides unrelated branches and compacts empty graph rows.
 Selecting several values within one multiselect matches units containing any of
 those values. Selections from different filter groups are combined, so a unit
 must satisfy every active group.
+
+The General section's Unit speed (km/h) filter sets a minimum movement speed.
+Infantry uses the game's base sprint speed with breed perk modifiers; squads
+use their slowest member. Mounted units use their vehicle's road speed. Each
+soldier's sprint speed is also shown in the comparison table. These are configured
+speeds; terrain, stamina, injuries, and carried equipment can affect actual
+movement. Unresolved speeds are shown as Unknown and do not match this filter.
 
 ### Infantry inventory
 

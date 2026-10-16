@@ -31,6 +31,7 @@ REQUIRED_GAME_FILES = {
     "vehicle_archive": Path("entity/-vehicle.pak"),
     "gamelogic_archive": Path("gamelogic.pak"),
     "localization_archive": Path("../localizations/default.pak"),
+    "properties_archive": Path("properties.pak"),
 }
 
 # Normalized research branches shown in the viewer. The game provides broad
@@ -98,6 +99,7 @@ class GameFiles:
     vehicle_archive: Path
     game_logic_archive: Path
     localization_archive: Path
+    properties_archive: Path
 
     @classmethod
     def from_game_directory(cls, game_directory: Path) -> "GameFiles":
@@ -109,6 +111,7 @@ class GameFiles:
             vehicle_archive=paths["vehicle_archive"],
             game_logic_archive=paths["gamelogic_archive"],
             localization_archive=paths["localization_archive"],
+            properties_archive=paths["properties_archive"],
         )
 
     def missing(self) -> list[Path]:
@@ -118,6 +121,7 @@ class GameFiles:
                 self.vehicle_archive,
                 self.game_logic_archive,
                 self.localization_archive,
+                self.properties_archive,
             )
             if not path.is_file()
         ]
@@ -281,8 +285,8 @@ def _po_value(lines: list[str], key: str) -> str | None:
     return None
 
 
-def annotate_localized_names(trees: list[dict], localization_archive: Path) -> tuple[int, int, int]:
-    """Replace internal identifiers with localized names and infantry levels."""
+def load_localizations(localization_archive: Path) -> dict[str, str]:
+    """Read the game's English names once for units, soldiers, and weapons."""
     if not localization_archive.is_file():
         raise RuntimeError(f"Localization archive not found: {localization_archive}")
 
@@ -298,7 +302,11 @@ def annotate_localized_names(trees: list[dict], localization_archive: Path) -> t
                 message = _po_value(lines, "msgid")
                 if context and message:
                     localized.setdefault(context, message)
+    return localized
 
+
+def annotate_localized_names(trees: list[dict], localized: dict[str, str]) -> tuple[int, int, int]:
+    """Replace internal identifiers with localized names and infantry levels."""
     # A few soldier localization keys capitalize aliases (for example Officer).
     human_contexts = {
         context.casefold(): context
@@ -436,6 +444,79 @@ def vehicle_speed(definition_text: str) -> float | None:
                         return float(speed_match.group(1))
                     break
     return None
+
+
+def brace_section(text: str, name: str) -> str:
+    """Read a balanced named section from a game definition."""
+    match = re.search(r'\{' + re.escape(name) + r'\b', text, re.IGNORECASE)
+    if not match:
+        return ""
+    depth = 0
+    for index in range(match.start(), len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[match.start():index + 1]
+    return ""
+
+
+def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
+    """Use vehicle road speed or the slowest soldier's maximum sprint speed."""
+    with ZipFile(game_files.properties_archive) as properties:
+        human = properties.read("properties/human.ext").decode("utf-8", errors="replace")
+    human = re.sub(r";[^\r\n]*", "", human)
+    running = brace_section(brace_section(human, "Chassis"), "Run")
+    fast = re.search(r'\{Fast\s+([0-9.]+)', running, re.IGNORECASE)
+    if not fast:
+        raise RuntimeError("Could not resolve infantry sprint speed from properties/human.ext")
+    base_speed = float(fast.group(1))
+
+    with ZipFile(game_files.game_logic_archive) as archive:
+        presets = {}
+        for path in archive.namelist():
+            if path.startswith("set/breed/presets/perks/") and path.endswith(".inc"):
+                text = archive.read(path).decode("utf-8", errors="replace")
+                text = re.sub(r";[^\r\n]*", "", text)
+                presets.update(_named_parenthesized_blocks(text, '(define '))
+
+        def expand_perks(text: str, active: frozenset = frozenset()) -> str:
+            def replace(match: re.Match) -> str:
+                name = match.group(1)
+                if name not in presets or name in active:
+                    return match.group(0)
+                return expand_perks(presets[name], active | {name})
+            return re.sub(r'\("([^"\n]+)"\)', replace, text)
+
+        speeds = {}
+        for tree in trees:
+            for node in tree["nodes"]:
+                member_speeds = []
+                for member in node.get("members") or []:
+                    path = (member.get("breed_file") or {}).get("path")
+                    if path and path not in speeds:
+                        text = archive.read(path).decode("utf-8", errors="replace")
+                        perks = expand_perks(brace_section(re.sub(r";[^\r\n]*", "", text), "perks"))
+                        modifiers = re.findall(r'\{\s*"?speed"?\s+([0-9.]+)\s*\}', perks)
+                        multiplier = float(modifiers[-1]) if modifiers else 1.0
+                        speeds[path] = round(base_speed * multiplier, 2)
+                    member["unit_speed_kmh"] = speeds.get(path)
+                    if member.get("count", 0) > 0 and member["unit_speed_kmh"] is not None:
+                        member_speeds.append(member["unit_speed_kmh"])
+
+                node["unit_speed_kmh"] = node.get("vehicle_speed_kmh")
+                node["unit_speed_basis"] = "Road speed" if node["unit_speed_kmh"] is not None else None
+                unit = node.get("unit") or {}
+                definition_type = str(unit.get("definition_type") or "")
+                on_foot = (
+                    definition_type.startswith("squad")
+                    and not definition_type.startswith("squad_vehicle")
+                    and not unit.get("vehicle")
+                )
+                if node["unit_speed_kmh"] is None and on_foot and member_speeds:
+                    node["unit_speed_kmh"] = min(member_speeds)
+                    node["unit_speed_basis"] = "Sprint speed (slowest member)"
 
 
 def armor_thickness(definition_text: str) -> tuple[float | None, float | None]:
@@ -677,7 +758,8 @@ def annotate_infantry_capabilities(
 
 
 def annotate_unit_metadata(
-    trees: list[dict], vehicle_archive: Path, gamelogic_archive: Path
+    trees: list[dict], vehicle_archive: Path, gamelogic_archive: Path,
+    localized: dict[str, str],
 ) -> tuple[int, int, int, int, int]:
     """Add indirect fire, primary reload time, and broad unit class metadata."""
     if not vehicle_archive.is_file():
@@ -762,6 +844,78 @@ def annotate_unit_metadata(
 
         weapon_metadata_cache: dict[str, tuple[float | None, float | None]] = {}
 
+        def ammo_id(value: str) -> str:
+            return " ".join(word for word in value.lower().split() if word != "ammo")
+
+        ammo_names = {
+            ammo_id(PurePosixPath(path).name.removesuffix(".ammo").replace(".", " "))
+            for path in gamelogic.namelist() if path.endswith(".ammo")
+        }
+        filling_cache: dict[str, tuple[str, int | None]] = {}
+
+        def weapon_filling(reference: str, active: frozenset = frozenset()) -> tuple[str, int | None]:
+            """Resolve inherited ammo family and magazine size from the weapon."""
+            if reference in filling_cache:
+                return filling_cache[reference]
+            if reference in active:
+                return "", None
+            for path in weapon_files.get(reference.lower(), []):
+                text = re.sub(r";[^\r\n]*", "", gamelogic.read(path).decode(errors="replace"))
+                filling = re.search(r'\{filling\s+"([^"]+)"(?:\s+(\d+))?\s*\}', text)
+                parent = re.search(r'\{from\s+"([^"]+)"', text)
+                inherited = ("", None)
+                if parent:
+                    parent_id = parent.group(1)
+                    if parent_id.startswith("pattern "):
+                        parent_id = parent_id.removeprefix("pattern ") + ".pattern"
+                    inherited = weapon_filling(parent_id, active | {reference})
+                result = (
+                    ammo_id(filling.group(1)),
+                    int(filling.group(2)) if filling.group(2) else inherited[1],
+                ) if filling else inherited
+                filling_cache[reference] = result
+                return result
+            return "", None
+
+        def vehicle_ammunition(text: str, reference: str) -> list[dict]:
+            """Match carried ammo to a gun, keeping loaded and spare counts apart."""
+            family, capacity = weapon_filling(reference)
+            loaded: dict[str, int] = defaultdict(int)
+            for match in re.finditer(
+                r'\{(?:weapon|item)\s+"' + re.escape(reference)
+                + r'"\s+(?:filling\s+"([^"]+)"\s+(\d+)|(filled)\b)', text
+            ):
+                if match.group(1):
+                    loaded[ammo_id(match.group(1))] += int(match.group(2))
+                elif family and capacity is not None:
+                    loaded[family] += capacity
+
+            families = {family} if family else set()
+            # Explicit ammunition also handles weapons whose default filling
+            # is defined by an engine pattern rather than a readable file.
+            for value in loaded:
+                if not any(value == key or value.startswith(key + " ") for key in families):
+                    families.add(value)
+            spare = {}
+            for match in re.finditer(r'\{item\s+"([^"]+)"\s+(\d+)\s*\}', text):
+                key = ammo_id(match.group(1))
+                is_ammo = key in ammo_names or "ammo" in match.group(1).lower().split()
+                if is_ammo and any(key == f or key.startswith(f + " ") for f in families):
+                    # Expanded includes follow the concrete definition; retain
+                    # its explicit count when a base definition repeats it.
+                    spare.setdefault(key, int(match.group(2)))
+
+            result = []
+            for key in dict.fromkeys([*spare, *loaded]):
+                name = localized.get(f"desc/ammo/{key}") or localized.get(f"desc/stuff/{key}") or key
+                name = re.sub(r"<c\([^)]*\)>(.*?)</c>", r"\1", name)
+                result.append({
+                    "id": key, "display_name": name,
+                    "spare_count": spare.get(key, 0), "loaded_count": loaded.get(key, 0),
+                    "total_count": spare.get(key, 0) + loaded.get(key, 0),
+                })
+            return result
+
         def weapon_metadata(
             reference: str, active: set[str] | None = None
         ) -> tuple[float | None, float | None]:
@@ -810,6 +964,12 @@ def annotate_unit_metadata(
                 unit = node.get("unit") or {}
                 for member in node.get("members") or []:
                     annotate_member_weapons(member, handheld_weapon_categories)
+                    for item in (member.get("breed_file") or {}).get("inventory_items") or []:
+                        item_id = re.sub(
+                            r"\s+grenade$", "", str(item.get("item") or ""),
+                            flags=re.IGNORECASE,
+                        ).lower()
+                        item["is_anti_tank_grenade"] = item_id in anti_tank_grenades
                 lookup_ids = []
                 if unit.get("vehicle"):
                     lookup_ids.append(unit["vehicle"])
@@ -825,7 +985,20 @@ def annotate_unit_metadata(
                 if node["indirect_fire"]:
                     indirect_count += 1
 
-                weapon_references = re.findall(r'\{weapon\s+"([^"]+)"', definition_text)
+                weapon_text = re.sub(r";[^\r\n]*", "", definition_text)
+                weapon_references = re.findall(r'\{weapon\s+"([^"]+)"', weapon_text)
+                # Some vehicles mount inventory weapons rather than naming
+                # them directly in a weaponry slot (for example the Dingo).
+                weapon_references.extend(re.findall(
+                    r'\{item\s+"([^"]+)"[^{}]*\{user\s+"[^"]+"\}', weapon_text
+                ))
+                weapon_references = list(dict.fromkeys(
+                    reference for reference in weapon_references
+                    if any(
+                        not path.startswith("set/stuff/special/")
+                        for path in weapon_files.get(reference.lower(), [])
+                    )
+                ))
                 weapon_options = [
                     (reference, *weapon_metadata(reference)) for reference in weapon_references
                 ]
@@ -835,7 +1008,28 @@ def annotate_unit_metadata(
                     if caliber_options
                     else (weapon_options[0] if weapon_options else (None, None, None))
                 )
-                node["primary_weapon"] = selected_weapon[0]
+                ordered_weapons = sorted(
+                    weapon_options, key=lambda option: option[0] != selected_weapon[0]
+                )
+                node["vehicle_weapons"] = []
+                for reference, reload_time, caliber in ordered_weapons:
+                    name = localized.get(f"desc/weapon/{reference}", reference)
+                    name = re.sub(r"<c\([^)]*\)>(.*?)</c>", r"\1", name)
+                    node["vehicle_weapons"].append({
+                        "id": reference, "display_name": name,
+                        "caliber_mm": caliber, "reload_time_seconds": reload_time,
+                        "ammunition": vehicle_ammunition(weapon_text, reference),
+                    })
+                for weapon in node["vehicle_weapons"]:
+                    for ammo in weapon["ammunition"]:
+                        ammo["shared_reserve"] = ammo["spare_count"] > 0 and sum(
+                            any(other_ammo["id"] == ammo["id"] for other_ammo in other["ammunition"])
+                            for other in node["vehicle_weapons"]
+                        ) > 1
+                node["primary_weapon"] = (
+                    node["vehicle_weapons"][0]["display_name"]
+                    if node["vehicle_weapons"] else None
+                )
                 node["reload_time"] = selected_weapon[1]
                 node["main_gun_caliber_mm"] = selected_weapon[2]
                 if node["reload_time"] is not None:
@@ -990,8 +1184,9 @@ def main() -> None:
         f"Classified {root_count} research roots and propagated branch types "
         f"to {branch_node_count} nodes"
     )
+    localized = load_localizations(game_files.localization_archive)
     localized_name_count, localized_level_count, member_name_count = annotate_localized_names(
-        trees, game_files.localization_archive
+        trees, localized
     )
     log(
         f"Resolved {localized_name_count} in-game unit names and "
@@ -1005,7 +1200,7 @@ def main() -> None:
         caliber_count,
         speed_count,
     ) = annotate_unit_metadata(
-        trees, game_files.vehicle_archive, game_files.game_logic_archive
+        trees, game_files.vehicle_archive, game_files.game_logic_archive, localized
     )
     log(
         f"Detected indirect-fire capability on {indirect_count} research nodes "
@@ -1015,6 +1210,11 @@ def main() -> None:
     log(f"Resolved frontal armor thickness for {armor_count} research nodes")
     log(f"Resolved main-gun caliber for {caliber_count} research nodes")
     log(f"Resolved vehicle road speed for {speed_count} research nodes")
+    annotate_unit_speeds(trees, game_files)
+    unit_speed_count = sum(
+        node["unit_speed_kmh"] is not None for tree in trees for node in tree["nodes"]
+    )
+    log(f"Resolved unit movement speed for {unit_speed_count} research nodes")
     if output_dir.exists():
         old_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
         log(f"Removing existing {output_dir} ({old_files} files)")
@@ -1059,7 +1259,8 @@ body.filters-collapsed #filter-panel { transform: translateX(-100%); }
 body.filters-collapsed #filter-toggle { left: 0; }
 .filter-heading { margin: 0 0 10px; font-size: 16px; }
 .filter-group { margin: 0 0 14px; padding: 10px; border: 1px solid #343a3d; border-radius: 6px; }
-.filter-group legend { padding: 0 5px; color: #e0ad4f; font-weight: 700; }
+.filter-group > summary { color: #e0ad4f; font-weight: 700; cursor: pointer; }
+.filter-group[open] > summary { margin-bottom: 10px; }
 .filter-group > label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; color: #b8c0c2; }
 .filter-group input[type="number"] { width: 92px; }
 .filter-group input[type="checkbox"] { width: auto; accent-color: #36a96c; }
@@ -1108,9 +1309,13 @@ body.filters-collapsed #viewport { left: 0; }
 .node.search-match { outline: 4px solid #d65cff; outline-offset: 2px; }
 .node.filter-match { background: #24563d; border-color: #73e4aa; box-shadow: 0 0 15px #50d79499; }
 .node.filter-match .node-title { background: #24563d; }
-#details { position: absolute; z-index: 10; right: 0; top: 54px; bottom: 0; width: min(1100px, 78vw); background: #171b1df5; border-left: 1px solid #495154; box-shadow: -8px 0 24px #0008; overflow: auto; padding: 18px; transform: translateX(100%); transition: transform .2s; }
-#details.open { transform: translateX(0); }
-#close-details { float: right; font-size: 18px; padding: 2px 8px; }
+#details { position: fixed; inset: 0; margin: auto; width: 70vw; height: calc(100dvh - 96px); max-width: 70vw; max-height: none; padding: 0; color: inherit; background: #171b1d; border: 1px solid #495154; border-radius: 10px; box-shadow: 0 16px 60px #000a; overflow: hidden; }
+#details[open] { display: flex; flex-direction: column; }
+#details::backdrop { background: #0007; }
+.stats-window-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 18px; border-bottom: 1px solid #495154; }
+.stats-window-header h2 { margin: 0; font-size: 17px; }
+#detail-content { min-height: 0; overflow: auto; padding: 10px 18px 24px; }
+#close-details { font-size: 20px; padding: 2px 10px; }
 .detail-head { display: flex; gap: 14px; align-items: flex-start; margin: 8px 0 14px; }
 .detail-head img { width: 112px; height: 140px; object-fit: cover; border: 1px solid #626a6c; border-radius: 5px; }
 .detail-head h2 { margin: 0 0 5px; font-size: 21px; }
@@ -1118,7 +1323,9 @@ body.filters-collapsed #viewport { left: 0; }
 .totals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 12px 0; }
 .total { padding: 8px; background: #252b2e; border-radius: 5px; text-align: center; }
 .total strong { display: block; font-size: 18px; color: #f0c873; }
-#details h3 { margin: 18px 0 7px; padding-bottom: 4px; border-bottom: 1px solid #42494c; }
+.stat-section { margin-top: 18px; }
+.stat-section > summary { cursor: pointer; font-size: 1.17em; font-weight: 700; padding-bottom: 4px; border-bottom: 1px solid #42494c; }
+.stat-section[open] > summary { margin-bottom: 7px; }
 .stats { display: grid; grid-template-columns: minmax(105px, .8fr) minmax(0, 1.2fr); gap: 1px; background: #343b3e; border: 1px solid #343b3e; }
 .stats dt, .stats dd { margin: 0; padding: 5px 7px; background: #202527; overflow-wrap: anywhere; }
 .stats dt { color: #aeb7b9; }
@@ -1151,7 +1358,8 @@ html[data-theme="light"] .badge, html[data-theme="light"] .cp-badge, html[data-t
 html[data-theme="light"] .cp-badge { color: #005b86; }
 html[data-theme="light"] .badge.units { color: #005b86; }
 html[data-theme="light"] .node.filter-match, html[data-theme="light"] .node.filter-match .node-title { background: #bcebcf; border-color: #16824a; }
-html[data-theme="light"] #details { background: #f8faf7f5; border-color: #aab4b1; box-shadow: -8px 0 24px #4555; }
+html[data-theme="light"] #details { background: #f8faf7; border-color: #aab4b1; box-shadow: 0 16px 60px #4557; }
+html[data-theme="light"] .stats-window-header { border-color: #aab4b1; }
 html[data-theme="light"] .muted { color: #626e70; }
 html[data-theme="light"] .total { background: #e4e9e6; }
 html[data-theme="light"] .total strong { color: #754900; }
@@ -1165,7 +1373,7 @@ html[data-theme="light"] .comparison .comparison-section th { background: #dce3d
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
 @media (max-width: 1000px) { #hint { display: none; } }
-@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } #details { width: 100%; } #toolbar h1 { display: none; } }
+@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } #details { height: calc(100dvh - 24px); } #toolbar h1 { display: none; } }
 </style>
 </head>
 <body>
@@ -1183,22 +1391,19 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 <button id="filter-toggle" title="Collapse filters" aria-label="Collapse filters" aria-expanded="true">‹</button>
 <aside id="filter-panel">
   <h2 class="filter-heading">Highlight filters</h2>
-  <button id="clear-filters">Clear filters</button>
-  <fieldset class="filter-group">
-    <legend>Research branches</legend>
-    <details class="multi-filter" id="branch-filter">
-      <summary id="branch-summary">Research branches: All</summary>
-      <div class="multi-options" id="branch-options" role="group" aria-label="Research branches"></div>
-    </details>
-  </fieldset>
-  <fieldset class="filter-group">
-    <legend>General</legend>
+  <details class="filter-group" id="branch-filter">
+    <summary id="branch-summary">Research branches: All</summary>
+    <div class="multi-options" id="branch-options" role="group" aria-label="Research branches"></div>
+  </details>
+  <details class="filter-group" open>
+    <summary>General</summary>
+    <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Unit speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Max command points <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
-  </fieldset>
-  <fieldset class="filter-group">
-    <legend>Infantry</legend>
+  </details>
+  <details class="filter-group">
+    <summary>Infantry</summary>
     <label>Min unit level <input id="min-level" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min AT weapons <input id="min-infantry-at" type="number" min="0" step="1" placeholder="Any"></label>
     <details class="multi-filter" id="inventory-filter">
@@ -1217,18 +1422,24 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <summary id="specialist-summary">Specialist types: All</summary>
       <div class="multi-options" id="specialist-options" role="group" aria-label="Specialist types"></div>
     </details>
-  </fieldset>
-  <fieldset class="filter-group">
-    <legend>Vehicles and guns</legend>
-    <label>Min vehicle speed (km/h) <input id="min-vehicle-speed" type="number" min="0" step="0.1" placeholder="Any"></label>
+  </details>
+  <details class="filter-group">
+    <summary>Vehicles and guns</summary>
     <label>Min front armour (mm) <input id="min-front-armor" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
-  </fieldset>
+  </details>
+  <button id="clear-filters">Clear filters</button>
   <div id="filter-count"></div>
 </aside>
 <main id="viewport"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></main>
-<aside id="details" aria-live="polite"><button id="close-details" title="Close">×</button><div id="detail-content"></div></aside>
+<dialog id="details" aria-labelledby="stats-window-title">
+  <header class="stats-window-header">
+    <h2 id="stats-window-title">Unit statistics</h2>
+    <button id="close-details" title="Close statistics (Esc)" aria-label="Close statistics" autofocus>×</button>
+  </header>
+  <div id="detail-content"></div>
+</dialog>
 <script id="tree-data" type="application/json">__TREE_DATA__</script>
 <script>
 (() => {
@@ -1245,7 +1456,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const minSizeInput = document.getElementById('min-size');
   const minLevelInput = document.getElementById('min-level');
   const minInfantryAtInput = document.getElementById('min-infantry-at');
-  const minVehicleSpeedInput = document.getElementById('min-vehicle-speed');
+  const minUnitSpeedInput = document.getElementById('min-unit-speed');
   const minFrontArmorInput = document.getElementById('min-front-armor');
   const minCaliberInput = document.getElementById('min-caliber');
   const maxReloadInput = document.getElementById('max-reload');
@@ -1510,7 +1721,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const hasMinSize = minSizeInput.value !== '';
     const hasMinLevel = minLevelInput.value !== '';
     const hasMinInfantryAt = minInfantryAtInput.value !== '';
-    const hasMinVehicleSpeed = minVehicleSpeedInput.value !== '';
+    const hasMinUnitSpeed = minUnitSpeedInput.value !== '';
     const hasMinFrontArmor = minFrontArmorInput.value !== '';
     const hasMinCaliber = minCaliberInput.value !== '';
     const hasMaxReload = maxReloadInput.value !== '';
@@ -1520,11 +1731,11 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinVehicleSpeed || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size;
+    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
-    const minVehicleSpeed = Number(minVehicleSpeedInput.value);
+    const minUnitSpeed = Number(minUnitSpeedInput.value);
     const minFrontArmor = Number(minFrontArmorInput.value);
     const minCaliber = Number(minCaliberInput.value);
     const maxReload = Number(maxReloadInput.value);
@@ -1535,7 +1746,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       const unitSize = node.stats?.unit_count;
       const unitLevel = node.unit_level;
       const infantryAt = node.anti_tank_weapon_count;
-      const vehicleSpeed = node.vehicle_speed_kmh;
+      const unitSpeed = node.unit_speed_kmh;
       const frontArmor = node.front_armor_thickness_mm;
       const caliber = node.main_gun_caliber_mm;
       const reload = node.reload_time;
@@ -1544,7 +1755,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!hasMinSize || (unitSize !== null && unitSize !== undefined && unitSize >= minSize))
         && (!hasMinLevel || (unitLevel !== null && unitLevel !== undefined && unitLevel >= minLevel))
         && (!hasMinInfantryAt || (node.unit_class === 'infantry' && infantryAt >= minInfantryAt))
-        && (!hasMinVehicleSpeed || (vehicleSpeed !== null && vehicleSpeed !== undefined && vehicleSpeed >= minVehicleSpeed))
+        && (!hasMinUnitSpeed || (unitSpeed !== null && unitSpeed !== undefined && unitSpeed >= minUnitSpeed))
         && (!hasMinFrontArmor || (frontArmor !== null && frontArmor !== undefined && frontArmor >= minFrontArmor))
         && (!hasMinCaliber || (caliber !== null && caliber !== undefined && caliber >= minCaliber))
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
@@ -1604,13 +1815,14 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       edge.element.classList.toggle('dimmed', !highlighted);
     }
     renderDetails(node, required);
-    details.classList.add('open');
+    detailContent.scrollTop = 0;
+    if (!details.open) details.showModal();
   }
 
   function clearHighlighting() {
     for (const element of nodeElements?.values() || []) element.classList.remove('selected', 'required', 'dimmed');
     for (const edge of edgeElements || []) edge.element.classList.remove('highlight', 'dimmed');
-    details.classList.remove('open');
+    if (details.open) details.close();
   }
 
   const hiddenStatFields = new Set([
@@ -1648,13 +1860,17 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   function inventoryRows(member) {
     const rows = {}, occurrences = new Map();
     for (const item of member.breed_file?.inventory_items || []) {
-      const name = item.display_name || item.item;
+      const name = (item.display_name || item.item) + (item.is_anti_tank_grenade ? ' (AT)' : '');
       const occurrence = (occurrences.get(name) || 0) + 1;
       occurrences.set(name, occurrence);
       const key = name + (occurrence > 1 ? ` (${occurrence})` : '');
       rows[key] = shown(item.payload) ? item.payload : 'Carried';
     }
     return rows;
+  }
+
+  function statSection(title, content, expanded = true) {
+    return `<details class="stat-section"${expanded ? ' open' : ''}><summary>${esc(title)}</summary>${content}</details>`;
   }
 
   function memberTables(node) {
@@ -1667,15 +1883,17 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     }
     return [...groups].map(([group, members]) => {
       const sections = [
-        {title: 'Composition', values: members.map(member => ({
-          amount_of_units: member.count, slot: member.slot,
-          command_points_each: member.command_points_each,
-          total_command_points: member.total_command_points, total_cost: member.total_cost,
-        }))},
         {title: 'Weapons (per soldier)', values: members.map(member => ({
           main_weapon: member.main_weapon,
           secondary_weapon: member.secondary_weapon,
           other_weapons: member.other_weapons,
+        }))},
+        {title: 'Inventory (per soldier)', values: members.map(inventoryRows)},
+        {title: 'Composition', values: members.map(member => ({
+          amount_of_units: member.count, slot: member.slot,
+          sprint_speed_kmh: member.unit_speed_kmh,
+          command_points_each: member.command_points_each,
+          total_command_points: member.total_command_points, total_cost: member.total_cost,
         }))},
         {title: 'Soldier stats', values: members.map(member => {
           const {raw, alias, ...stats} = member.declaration || {};
@@ -1685,11 +1903,26 @@ html[data-theme="light"] .notice { background: #fff0d4; }
           const {inventory_items, ...stats} = member.breed_file || {};
           return stats;
         })},
-        {title: 'Inventory (per soldier)', values: members.map(inventoryRows)},
       ];
       const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
-      return `<h3>${esc(group)} (${count})</h3>${comparisonTable(members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections)}`;
+      return statSection(`${group} (${count})`, comparisonTable(
+        members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections
+      ));
     }).join('');
+  }
+
+  function vehicleWeaponRows(node) {
+    const rows = {};
+    for (const [index, weapon] of (node.vehicle_weapons || []).entries()) {
+      const prefix = index === 0 ? 'primary_gun' : index === 1 ? 'secondary_gun' : `other_gun_${index - 1}`;
+      rows[prefix] = weapon.display_name;
+      rows[`${prefix}_caliber_mm`] = weapon.caliber_mm;
+      rows[`${prefix}_reload_time_seconds`] = weapon.reload_time_seconds;
+      rows[`${prefix}_ammunition`] = weapon.ammunition?.length
+        ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
+        : 'Unknown';
+    }
+    return rows;
   }
 
   function renderDetails(node, required) {
@@ -1702,26 +1935,28 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const {raw, members, ...unitStats} = unit || {};
     const hasVehicle = unit && (unit.vehicle || unit.definition_type?.startsWith('vehicle') || unit.definition_type?.startsWith('squad_vehicle'));
     const unitTable = unit ? comparisonTable([hasVehicle ? (node.vehicle_display_name || node.display_name) : node.display_name], [
-      {title: 'Unit stats', values: [unitStats]},
       ...(hasVehicle ? [{title: 'Vehicle and gun stats', values: [{
+        ...vehicleWeaponRows(node),
         vehicle_speed_kmh: node.vehicle_speed_kmh,
-        indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No',
         front_armor_thickness_mm: node.front_armor_thickness_mm,
         maximum_armor_thickness_mm: node.maximum_armor_thickness_mm,
-        primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm,
-        reload_time_seconds: node.reload_time,
       }]}] : []),
+      {title: 'Unit stats', values: [{
+        unit_speed_kmh: node.unit_speed_kmh ?? 'Unknown',
+        speed_basis: node.unit_speed_basis, ...unitStats,
+      }]},
     ]) : '<p class="muted">No unit definition</p>';
     const requirementNames = [...required].map(id => byId.get(id)?.display_name || id);
     detailContent.innerHTML = `
       <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
       <div class="totals"><div class="total"><strong>${esc(number(node.cost))}</strong>Own RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
-      <h3>Unlock prerequisites (${required.size})</h3>${requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>'}
-      <h3>Research data</h3>${statRows({cost: node.cost, indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'})}
-      <h3>Aggregate unit stats</h3>${statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time})}
-      <h3>${hasVehicle ? 'Vehicle / gun' : 'Formation'} stats</h3>${unitTable}
-      ${memberTables(node)}`;
+      ${statSection('Research data', statRows({cost: node.cost}), false)}
+      ${statSection('Aggregate unit stats', statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time}), false)}
+      ${statSection(`${hasVehicle ? 'Vehicle / gun' : 'Formation'} stats`, unitTable)}
+      ${memberTables(node)}
+      ${statSection('Other', statRows({indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'}))}
+      ${statSection(`Unlock prerequisites (${required.size})`, requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>')}`;
   }
 
   function fitTree() {
@@ -1778,6 +2013,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   factionSelect.addEventListener('change', () => renderTree(factionSelect.value));
   document.getElementById('clear').addEventListener('click', clearHighlighting);
   document.getElementById('close-details').addEventListener('click', clearHighlighting);
+  details.addEventListener('cancel', event => {
+    event.preventDefault();
+    clearHighlighting();
+  });
   document.getElementById('fit').addEventListener('click', fitTree);
   document.getElementById('zoom-in').addEventListener('click', () => zoomAt(1.25));
   document.getElementById('zoom-out').addEventListener('click', () => zoomAt(.8));
@@ -1790,7 +2029,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     event.currentTarget.setAttribute('aria-expanded', String(!collapsed));
     setTimeout(fitTree, 210);
   });
-  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minVehicleSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput, hasIndirectFireInput];
+  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput, hasIndirectFireInput];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
@@ -1800,7 +2039,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
   branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); fitTree(); });
   document.getElementById('clear-filters').addEventListener('click', () => {
-    for (const input of [minSizeInput, minLevelInput, minInfantryAtInput, minVehicleSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput]) input.value = '';
+    for (const input of [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput]) input.value = '';
     hasIndirectFireInput.checked = false;
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
     updateFilterSummaries(); applyFilters(); fitTree();
