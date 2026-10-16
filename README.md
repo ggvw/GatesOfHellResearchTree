@@ -27,6 +27,10 @@ maintained database.
 - Localized main, secondary, and additional carried weapons for each soldier
 - Localized vehicle guns and machine guns, with calibre and reload statistics
 - Per-gun ammunition types and counts, including spare and loaded rounds
+- Rounds before reload for infantry and vehicle weapons, with a primary-weapon
+  minimum-capacity filter in General
+- Weapon rate of fire in RPM, with a primary-weapon minimum-rate filter
+- Firepower metrics with filters, role-group percentiles, and target-specific help
 - A self-contained `index.html` that works without a web server
 -  <img width="1157" height="795" alt="Screenshot from 2026-10-16 10-15-31" src="https://github.com/user-attachments/assets/e50a340a-5d30-4615-ba6b-6caf54439df2" />
 
@@ -49,6 +53,48 @@ use their slowest member. Mounted units use their vehicle's road speed. Each
 soldier's sprint speed is also shown in the comparison table. These are configured
 speeds; terrain, stamina, injuries, and carried equipment can affect actual
 movement. Unresolved speeds are shown as Unknown and do not match this filter.
+
+Min rounds before reload checks the primary vehicle gun, or any soldier's main
+weapon in an infantry squad. Secondary and additional weapons do not affect
+matching. This is weapon capacity, separate from starting loaded rounds and
+total ammunition carried. Unknown capacities do not match the filter.
+
+Min rate of fire (RPM) uses the same primary-weapon rule. Rates come from weapon
+definitions and their inherited presets. For single-shot weapons without an
+explicit rate, RPM is calculated as 60 divided by reload time in seconds.
+AI burst pauses, aiming, and other delays can reduce actual firing rates.
+
+### Firepower
+
+The stats panel and filter panel include help explaining each estimate and its
+limitations. Hover over metric labels for a short explanation.
+
+| Metric | Meaning | Useful for |
+| --- | --- | --- |
+| Burst output | Shots in the first 5 seconds, including reloads | Short engagements against infantry |
+| Sustained output | Average rounds per minute across reload cycles | Prolonged infantry engagements and potential volume of suppressive fire |
+| Firepower per CP | Sustained output divided by total CP | Comparing purchasing efficiency within similar roles |
+| Calibre-weighted output | Sustained output weighted linearly by calibre / 7.62 mm | Comparing similar guns; not a penetration or damage estimate |
+| Firing endurance | Time until the earliest included weapon empties its first magazine | Identifying firing windows and reload gaps; longer is not always better |
+
+Infantry estimates sum main weapons using each soldier's quantity. Vehicle
+estimates sum mounted guns, including repeated mounts of a gun type, and exclude
+crew sidearms. They assume fully loaded weapons, simultaneous firing, and
+unlimited resupply for sustained output. AI pauses, accuracy, aiming, firing
+arcs, crew conflicts, explosive damage, range, armour, and survivability are
+not modelled. Missing required inputs make the affected score Unknown.
+
+These metrics measure theoretical fire volume, not overall danger or kills.
+Against infantry, start with burst and sustained output. Against light vehicles,
+also check ammunition and penetration. Against tanks, penetration at range,
+ammunition, armour, and impact angle matter: these scores cannot determine
+anti-armour effectiveness, regardless of calibre or machine-gun output.
+
+Minimum-value filters use the raw unit estimates. Percentiles alongside the
+stats compare units within the active faction and role group; they are not
+damage percentages. Ties share a rank and single-unit groups receive 50.
+Zero or missing CP produces an unknown efficiency score. All active filters
+must match, and Unknown values do not match a numeric filter.
 
 ### Infantry inventory
 
@@ -176,6 +222,7 @@ deliberately excluded.
 ```text
 export_research_trees.py       Extract game data and images
 create_research_tree_html.py   Enrich the export and build the viewer
+firepower.py                   Calculate firepower estimates and percentiles
 research_export/               Generated intermediate data (ignored)
 research_tree_html/            Generated website (ignored)
 ```
@@ -184,6 +231,12 @@ research_tree_html/            Generated website (ignored)
 
 When changing a parser, test against a current unmodified game installation and
 run both stages end to end. Please avoid committing generated game data or assets.
+
+Run the firepower calculation tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## License
 
