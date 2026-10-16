@@ -22,7 +22,7 @@ maintained database.
 - Research-branch multiselect for infantry, support-weapon, and vehicle branches;
   selected branches retain shared prerequisites and collapse empty graph rows
 - Detailed unit, member, weapon, and equipment statistics
-- A wide popup stats window with scrollable comparison tables for infantry and crew,
+- A resizable right-side stats panel with scrollable comparison tables for infantry and crew,
   vehicle statistics in a separate table and quantities shown for each variant
 - Localized main, secondary, and additional carried weapons for each soldier
 - Localized vehicle guns and machine guns, with calibre and reload statistics

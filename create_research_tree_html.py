@@ -1273,6 +1273,7 @@ body.filters-collapsed #filter-toggle { left: 0; }
 .multi-options label:hover { background: #2b3336; border-radius: 3px; }
 #clear-filters { width: 100%; margin: 2px 0 9px; }
 #viewport { position: absolute; inset: 54px 0 0 300px; overflow: hidden; cursor: grab; background-color: #0d1112; background-image: radial-gradient(#303638 1px, transparent 1px); background-size: 24px 24px; transition: left .2s; }
+body.stats-open #viewport { right: var(--stats-width, 560px); }
 body.filters-collapsed #viewport { left: 0; }
 #viewport.dragging { cursor: grabbing; }
 #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
@@ -1309,9 +1310,11 @@ body.filters-collapsed #viewport { left: 0; }
 .node.search-match { outline: 4px solid #d65cff; outline-offset: 2px; }
 .node.filter-match { background: #24563d; border-color: #73e4aa; box-shadow: 0 0 15px #50d79499; }
 .node.filter-match .node-title { background: #24563d; }
-#details { position: fixed; inset: 0; margin: auto; width: 70vw; height: calc(100dvh - 96px); max-width: 70vw; max-height: none; padding: 0; color: inherit; background: #171b1d; border: 1px solid #495154; border-radius: 10px; box-shadow: 0 16px 60px #000a; overflow: hidden; }
-#details[open] { display: flex; flex-direction: column; }
-#details::backdrop { background: #0007; }
+#details { position: absolute; z-index: 11; top: 54px; bottom: 0; right: 0; width: var(--stats-width, 560px); display: flex; flex-direction: column; padding: 0 0 0 7px; color: inherit; background: #171b1d; border-left: 1px solid #495154; box-shadow: -5px 0 18px #0006; overflow: hidden; }
+#details[hidden] { display: none; }
+#stats-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 7px; cursor: col-resize; touch-action: none; background: #495154; }
+#stats-resize:hover, #stats-resize:focus-visible { background: var(--accent); }
+body.resizing-stats { cursor: col-resize; user-select: none; }
 .stats-window-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 18px; border-bottom: 1px solid #495154; }
 .stats-window-header h2 { margin: 0; font-size: 17px; }
 #detail-content { min-height: 0; overflow: auto; padding: 10px 18px 24px; }
@@ -1358,7 +1361,7 @@ html[data-theme="light"] .badge, html[data-theme="light"] .cp-badge, html[data-t
 html[data-theme="light"] .cp-badge { color: #005b86; }
 html[data-theme="light"] .badge.units { color: #005b86; }
 html[data-theme="light"] .node.filter-match, html[data-theme="light"] .node.filter-match .node-title { background: #bcebcf; border-color: #16824a; }
-html[data-theme="light"] #details { background: #f8faf7; border-color: #aab4b1; box-shadow: 0 16px 60px #4557; }
+html[data-theme="light"] #details { background: #f8faf7; border-color: #aab4b1; box-shadow: -5px 0 18px #4554; }
 html[data-theme="light"] .stats-window-header { border-color: #aab4b1; }
 html[data-theme="light"] .muted { color: #626e70; }
 html[data-theme="light"] .total { background: #e4e9e6; }
@@ -1373,7 +1376,7 @@ html[data-theme="light"] .comparison .comparison-section th { background: #dce3d
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
 @media (max-width: 1000px) { #hint { display: none; } }
-@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } #details { height: calc(100dvh - 24px); } #toolbar h1 { display: none; } }
+@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } #toolbar h1 { display: none; } }
 </style>
 </head>
 <body>
@@ -1390,19 +1393,20 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 </header>
 <button id="filter-toggle" title="Collapse filters" aria-label="Collapse filters" aria-expanded="true">‹</button>
 <aside id="filter-panel">
-  <h2 class="filter-heading">Highlight filters</h2>
+  <h2 class="filter-heading">Show</h2>
   <details class="filter-group" id="branch-filter">
     <summary id="branch-summary">Research branches: All</summary>
     <div class="multi-options" id="branch-options" role="group" aria-label="Research branches"></div>
   </details>
-  <details class="filter-group" open>
+  <h2 class="filter-heading">Highlight filters</h2>
+  <details class="filter-group" id="general-filter" open>
     <summary>General</summary>
     <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Unit speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Max command points <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
   </details>
-  <details class="filter-group">
+  <details class="filter-group" id="infantry-filter">
     <summary>Infantry</summary>
     <label>Min unit level <input id="min-level" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min AT weapons <input id="min-infantry-at" type="number" min="0" step="1" placeholder="Any"></label>
@@ -1423,7 +1427,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <div class="multi-options" id="specialist-options" role="group" aria-label="Specialist types"></div>
     </details>
   </details>
-  <details class="filter-group">
+  <details class="filter-group" id="vehicles-filter">
     <summary>Vehicles and guns</summary>
     <label>Min front armour (mm) <input id="min-front-armor" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
@@ -1433,13 +1437,14 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   <div id="filter-count"></div>
 </aside>
 <main id="viewport"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></main>
-<dialog id="details" aria-labelledby="stats-window-title">
+<aside id="details" aria-labelledby="stats-window-title" hidden>
+  <div id="stats-resize" role="separator" aria-label="Resize statistics panel" aria-orientation="vertical" tabindex="0" aria-controls="details"></div>
   <header class="stats-window-header">
     <h2 id="stats-window-title">Unit statistics</h2>
-    <button id="close-details" title="Close statistics (Esc)" aria-label="Close statistics" autofocus>×</button>
+    <button id="close-details" title="Close statistics (Esc)" aria-label="Close statistics">×</button>
   </header>
   <div id="detail-content"></div>
-</dialog>
+</aside>
 <script id="tree-data" type="application/json">__TREE_DATA__</script>
 <script>
 (() => {
@@ -1451,6 +1456,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const nodesLayer = document.getElementById('nodes');
   const details = document.getElementById('details');
   const detailContent = document.getElementById('detail-content');
+  const statsResize = document.getElementById('stats-resize');
+  let selectedNodeId = null, statsWidth = 560, statsDrag = null;
   const factionSelect = document.getElementById('faction');
   const themeButton = document.getElementById('theme');
   const minSizeInput = document.getElementById('min-size');
@@ -1480,6 +1487,32 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const label = key => key.replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   const shown = value => value !== null && value !== undefined && value !== '' && (!Array.isArray(value) || value.length);
   const number = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+
+  function sectionStorageKey(section, group) {
+    return `research-tree-sections:${group}:${section.dataset.stateKey || section.id}`;
+  }
+
+  function saveSectionStates(container, group) {
+    for (const section of container.querySelectorAll('details')) {
+      try { localStorage.setItem(sectionStorageKey(section, group), String(section.open)); } catch (_) {}
+    }
+  }
+
+  function restoreSectionStates(container, group) {
+    for (const section of container.querySelectorAll('details')) {
+      const key = sectionStorageKey(section, group);
+      try {
+        const saved = localStorage.getItem(key);
+        if (saved === 'true' || saved === 'false') section.open = saved === 'true';
+      } catch (_) {}
+      section.addEventListener('toggle', () => {
+        // Replacing the selected unit can leave a queued toggle on old markup.
+        if (!section.isConnected) return;
+        try { localStorage.setItem(key, String(section.open)); } catch (_) {}
+      });
+    }
+  }
+  restoreSectionStates(document.getElementById('filter-panel'), 'filters');
 
   function applyTheme(theme) {
     document.documentElement.dataset.theme = theme;
@@ -1802,6 +1835,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function selectNode(nodeId) {
+    selectedNodeId = nodeId;
     const node = byId.get(nodeId), required = prerequisiteSet(nodeId);
     const active = new Set(required); active.add(nodeId);
     for (const [id, element] of nodeElements) {
@@ -1816,13 +1850,21 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     }
     renderDetails(node, required);
     detailContent.scrollTop = 0;
-    if (!details.open) details.showModal();
+    details.hidden = false;
+    document.body.classList.add('stats-open');
+    resizeStatsPanel(statsWidth);
   }
 
   function clearHighlighting() {
+    selectedNodeId = null;
     for (const element of nodeElements?.values() || []) element.classList.remove('selected', 'required', 'dimmed');
     for (const edge of edgeElements || []) edge.element.classList.remove('highlight', 'dimmed');
-    if (details.open) details.close();
+    closeStatsPanel();
+  }
+
+  function closeStatsPanel() {
+    details.hidden = true;
+    document.body.classList.remove('stats-open');
   }
 
   const hiddenStatFields = new Set([
@@ -1870,7 +1912,9 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function statSection(title, content, expanded = true) {
-    return `<details class="stat-section"${expanded ? ' open' : ''}><summary>${esc(title)}</summary>${content}</details>`;
+    // Counts vary by unit; the section preference belongs to its stable name.
+    const key = title.replace(/ \(\d+\)$/, '');
+    return `<details class="stat-section" data-state-key="${esc(key)}"${expanded ? ' open' : ''}><summary>${esc(title)}</summary>${content}</details>`;
   }
 
   function memberTables(node) {
@@ -1926,6 +1970,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function renderDetails(node, required) {
+    saveSectionStates(detailContent, 'stats');
     const allNodes = [node, ...[...required].map(id => byId.get(id)).filter(Boolean)];
     const totalCost = allNodes.reduce((sum, item) => sum + Number(item.cost || 0), 0);
     const missing = new Set();
@@ -1957,6 +2002,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       ${memberTables(node)}
       ${statSection('Other', statRows({indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'}))}
       ${statSection(`Unlock prerequisites (${required.size})`, requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>')}`;
+    restoreSectionStates(detailContent, 'stats');
   }
 
   function fitTree() {
@@ -1981,6 +2027,59 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const wx = (cx - tx) / scale, wy = (cy - ty) / scale;
     tx = cx - wx * next; ty = cy - wy * next; scale = next; setTransform();
   }
+
+  function keepSelectedNodeVisible() {
+    if (!selectedNodeId || nodeElements.get(selectedNodeId)?.style.display === 'none') return;
+    const node = byId.get(selectedNodeId);
+    if (!node) return;
+    const position = nodePosition(node), margin = 12;
+    scale = Math.min(scale, Math.max(.05, (viewport.clientWidth - margin * 2) / NODE_W));
+    const left = position.x * scale + tx, top = position.y * scale + ty;
+    if (left < margin) tx += margin - left;
+    else if (left + NODE_W * scale > viewport.clientWidth - margin) {
+      tx -= left + NODE_W * scale - viewport.clientWidth + margin;
+    }
+    if (top < margin) ty += margin - top;
+    else if (top + NODE_H * scale > viewport.clientHeight - margin) {
+      ty -= top + NODE_H * scale - viewport.clientHeight + margin;
+    }
+    setTransform();
+  }
+
+  function resizeStatsPanel(width) {
+    // Reserve graph space even when the filter panel is expanded.
+    const max = Math.max(160, window.innerWidth - viewport.offsetLeft - 180);
+    const min = Math.min(300, max);
+    statsWidth = Math.max(min, Math.min(max, width));
+    document.body.style.setProperty('--stats-width', `${statsWidth}px`);
+    statsResize.setAttribute('aria-valuemin', min);
+    statsResize.setAttribute('aria-valuemax', max);
+    statsResize.setAttribute('aria-valuenow', Math.round(statsWidth));
+    keepSelectedNodeVisible();
+  }
+
+  statsResize.addEventListener('pointerdown', event => {
+    if (event.button !== 0) return;
+    statsDrag = {x: event.clientX, width: statsWidth};
+    statsResize.setPointerCapture(event.pointerId);
+    document.body.classList.add('resizing-stats');
+    event.preventDefault();
+  });
+  statsResize.addEventListener('pointermove', event => {
+    if (statsDrag) resizeStatsPanel(statsDrag.width + statsDrag.x - event.clientX);
+  });
+  function stopStatsResize() {
+    statsDrag = null;
+    document.body.classList.remove('resizing-stats');
+  }
+  statsResize.addEventListener('pointerup', stopStatsResize);
+  statsResize.addEventListener('pointercancel', stopStatsResize);
+  statsResize.addEventListener('lostpointercapture', stopStatsResize);
+  statsResize.addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    resizeStatsPanel(statsWidth + (event.key === 'ArrowLeft' ? 24 : -24));
+  });
 
   viewport.addEventListener('wheel', event => { event.preventDefault(); const rect = viewport.getBoundingClientRect(); zoomAt(event.deltaY < 0 ? 1.12 : .89, event.clientX - rect.left, event.clientY - rect.top); }, {passive:false});
   viewport.addEventListener('pointerdown', event => {
@@ -2012,10 +2111,9 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   });
   factionSelect.addEventListener('change', () => renderTree(factionSelect.value));
   document.getElementById('clear').addEventListener('click', clearHighlighting);
-  document.getElementById('close-details').addEventListener('click', clearHighlighting);
-  details.addEventListener('cancel', event => {
-    event.preventDefault();
-    clearHighlighting();
+  document.getElementById('close-details').addEventListener('click', closeStatsPanel);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !details.hidden) closeStatsPanel();
   });
   document.getElementById('fit').addEventListener('click', fitTree);
   document.getElementById('zoom-in').addEventListener('click', () => zoomAt(1.25));
@@ -2027,7 +2125,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     event.currentTarget.title = collapsed ? 'Expand filters' : 'Collapse filters';
     event.currentTarget.setAttribute('aria-label', event.currentTarget.title);
     event.currentTarget.setAttribute('aria-expanded', String(!collapsed));
-    setTimeout(fitTree, 210);
+    setTimeout(() => {
+      if (details.hidden) fitTree();
+      else resizeStatsPanel(statsWidth);
+    }, 210);
   });
   const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput, hasIndirectFireInput];
   for (const control of filterControls) control.addEventListener('input', () => {
@@ -2051,7 +2152,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       element.classList.toggle('search-match', !!query && (id.toLowerCase().includes(query) || node.display_name.toLowerCase().includes(query)));
     }
   });
-  window.addEventListener('resize', fitTree);
+  window.addEventListener('resize', () => {
+    if (details.hidden) fitTree();
+    else resizeStatsPanel(statsWidth);
+  });
   renderTree(trees[0].faction);
 })();
 </script>
