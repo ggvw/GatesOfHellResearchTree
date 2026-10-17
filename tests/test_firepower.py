@@ -55,31 +55,38 @@ class FirepowerTests(unittest.TestCase):
         self.assertAlmostEqual(weapon_firepower(weapon(caliber=15.24))["caliber_weighted_rpm"], 90)
         self.assertIsNone(weapon_firepower(weapon(caliber=None))["caliber_weighted_rpm"])
 
-    def test_squad_quantities_and_main_weapon_only(self):
-        node = infantry(count=3, weapons=[weapon(), weapon(rate=900)], cp=6)
+    def test_squad_quantities_keep_primary_and_secondary_separate(self):
+        node = infantry(count=3, weapons=[weapon(), weapon(rate=120, capacity=10)], cp=6)
         annotate_firepower([{"nodes": [node]}])
-        self.assertEqual(node["firepower"]["burst_rounds_5s"], 12)
-        self.assertEqual(node["firepower"]["sustained_rpm"], 135)
-        self.assertEqual(node["firepower"]["rounds_per_minute_per_cp"], 22.5)
-        self.assertEqual(node["firepower"]["firing_endurance_seconds"], 2)
+        self.assertEqual(node["firepower"]["primary"]["burst_rounds_5s"], 12)
+        self.assertEqual(node["firepower"]["primary"]["sustained_rpm"], 135)
+        self.assertEqual(node["firepower"]["primary"]["rounds_per_minute_per_cp"], 22.5)
+        self.assertEqual(node["firepower"]["primary"]["firing_endurance_seconds"], 2)
+        secondary = node["firepower"]["secondary"]
+        self.assertEqual(secondary["weapon_count"], 3)
+        self.assertEqual(secondary["burst_rounds_5s"], 30)
+        self.assertAlmostEqual(secondary["sustained_rpm"], 1800 / 6.5)
+        self.assertAlmostEqual(secondary["rounds_per_minute_per_cp"], 300 / 6.5)
 
     def test_vehicle_counts_mounts_and_excludes_crew_weapons(self):
         node = infantry(count=5)
-        node["vehicle_weapons"] = [weapon(mounts=2)]
+        node["vehicle_weapons"] = [weapon(mounts=2), weapon(rate=120, capacity=10, mounts=3)]
         annotate_firepower([{"nodes": [node]}])
-        self.assertEqual(node["firepower"]["weapon_count"], 2)
-        self.assertEqual(node["firepower"]["sustained_rpm"], 90)
+        self.assertEqual(node["firepower"]["primary"]["weapon_count"], 2)
+        self.assertEqual(node["firepower"]["primary"]["sustained_rpm"], 90)
+        self.assertEqual(node["firepower"]["secondary"]["weapon_count"], 3)
+        self.assertEqual(node["firepower"]["secondary"]["burst_rounds_5s"], 30)
 
     def test_zero_cp_has_no_efficiency_score(self):
         node = infantry(cp=0)
         annotate_firepower([{"nodes": [node]}])
-        self.assertIsNone(node["firepower"]["rounds_per_minute_per_cp"])
+        self.assertIsNone(node["firepower"]["primary"]["rounds_per_minute_per_cp"])
 
     def test_missing_member_weapon_does_not_silently_reduce_score(self):
         node = infantry()
         node["members"].append({"count": 1, "weapons": []})
         annotate_firepower([{"nodes": [node]}])
-        self.assertIsNone(node["firepower"]["sustained_rpm"])
+        self.assertIsNone(node["firepower"]["primary"]["sustained_rpm"])
 
     def test_percentiles_handle_ties_and_stay_within_faction_and_role(self):
         low, tied, high = infantry(), infantry(), infantry(count=2)
@@ -87,16 +94,40 @@ class FirepowerTests(unittest.TestCase):
         other_faction = infantry(count=20)
         annotate_firepower([{"nodes": [low, tied, high, vehicle]}, {"nodes": [other_faction]}])
         for node in (low, tied):
-            self.assertEqual(node["firepower"]["percentiles"]["sustained_rpm"], 25)
-        self.assertEqual(high["firepower"]["percentiles"]["sustained_rpm"], 100)
-        self.assertEqual(vehicle["firepower"]["percentiles"]["sustained_rpm"], 50)
-        self.assertEqual(other_faction["firepower"]["percentiles"]["sustained_rpm"], 50)
+            self.assertEqual(node["firepower"]["primary"]["percentiles"]["sustained_rpm"], 25)
+        self.assertEqual(high["firepower"]["primary"]["percentiles"]["sustained_rpm"], 100)
+        self.assertEqual(vehicle["firepower"]["primary"]["percentiles"]["sustained_rpm"], 50)
+        self.assertEqual(other_faction["firepower"]["primary"]["percentiles"]["sustained_rpm"], 50)
 
     def test_unarmed_object_is_unknown(self):
         node = {"unit_class": "other", "unit": {"cp": 2}}
         annotate_firepower([{"nodes": [node]}])
-        self.assertIsNone(node["firepower"]["sustained_rpm"])
-        self.assertEqual(node["firepower"]["percentiles"], {})
+        self.assertIsNone(node["firepower"]["primary"]["sustained_rpm"])
+        self.assertEqual(node["firepower"]["primary"]["percentiles"], {})
+        self.assertIsNone(node["firepower"]["secondary"]["sustained_rpm"])
+        self.assertEqual(node["firepower"]["secondary"]["weapon_count"], 0)
+        self.assertEqual(node["firepower"]["secondary"]["percentiles"], {})
+        self.assertEqual(node["firepower"]["other"], [])
+
+    def test_percentiles_compare_weapon_slots_independently(self):
+        first = infantry(weapons=[weapon(), weapon(rate=120, capacity=10)])
+        second = infantry(weapons=[weapon(rate=120, capacity=10), weapon()])
+        annotate_firepower([{"nodes": [first, second]}])
+        self.assertEqual(first["firepower"]["primary"]["percentiles"]["sustained_rpm"], 0)
+        self.assertEqual(first["firepower"]["secondary"]["percentiles"]["sustained_rpm"], 100)
+        self.assertEqual(second["firepower"]["primary"]["percentiles"]["sustained_rpm"], 100)
+        self.assertEqual(second["firepower"]["secondary"]["percentiles"]["sustained_rpm"], 0)
+
+    def test_additional_weapons_stay_separate_without_percentiles(self):
+        node = infantry(count=2, weapons=[weapon(), weapon(), weapon(rate=120, capacity=10)])
+        annotate_firepower([{"nodes": [node]}])
+        self.assertEqual(node["firepower"]["primary"]["burst_rounds_5s"], 8)
+        self.assertEqual(node["firepower"]["secondary"]["burst_rounds_5s"], 8)
+        self.assertEqual(len(node["firepower"]["other"]), 1)
+        additional = node["firepower"]["other"][0]
+        self.assertEqual(additional["weapon_count"], 2)
+        self.assertEqual(additional["burst_rounds_5s"], 20)
+        self.assertEqual(additional["percentiles"], {})
 
 
 if __name__ == "__main__":

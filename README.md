@@ -10,6 +10,7 @@ maintained database.
 ## Features
 
 - Navigable research graph for every detected faction
+- Automatic Steam Workshop discovery with a single-mod selector and separate base-game data
 - Localized in-game unit names and infantry levels
 - Unit portraits and icons extracted from the game archives
 - Prerequisite highlighting and total research-point calculation
@@ -63,6 +64,15 @@ Min rate of fire (RPM) uses the same primary-weapon rule. Rates come from weapon
 definitions and their inherited presets. For single-shot weapons without an
 explicit rate, RPM is calculated as 60 divided by reload time in seconds.
 AI burst pauses, aiming, and other delays can reduce actual firing rates.
+
+Indirect fire includes mortar and artillery entity settings, the PIAT carried by
+infantry, the Sturmmörser’s RW61 rocket mortar, and mounted weapons with curved-fire
+settings or howitzer presets.
+Weapon inheritance and the selected mod's overrides are respected. This indicates
+capability with at least one weapon; it does not change an infantry squad or
+tank's role classification. Generic projectile gravity alone is not sufficient.
+The PIAT and RW61 are explicitly classified because their game definitions
+share generic RPG/rocket patterns without a distinct indirect-fire flag.
 
 ### Firepower
 
@@ -179,6 +189,41 @@ Then build the HTML viewer:
 
 Open `research_tree_html/index.html` in a browser.
 
+### Steam Workshop mods
+
+No extra arguments are needed. The exporter finds Workshop content for app
+`400750` in the game's Steam library and other libraries registered in
+`libraryfolders.vdf`. Run both commands above after installing or updating mods.
+The viewer's **Mod** selector, immediately left of the faction selector, defaults
+to **None** (base game). Select one installed mod to switch its factions, unit
+stats, localized names, and images without rebuilding or running a web server.
+
+Each dataset starts with base-game resources, then applies the mod's required
+Workshop dependencies in declaration order, followed by the selected mod.
+Unrelated installed mods are never combined. Within each resource layer,
+archives are mounted in sorted path order at their containing directories,
+then loose files override archived files. File paths are matched without case
+sensitivity. Mod deletion directives are applied before mounting that mod.
+Both build stages use this same precedence for research, rosters, breeds,
+weapons, entities, properties, localization, and images, including custom archive
+names. The active conquest roster's includes determine which unit definitions
+are loaded. English names come from default localization archives and resource
+localization files.
+
+The export retains base factions at its root, stores mod factions under
+`mods/WORKSHOP_ID/`, and records their dependency layers in `datasets.json`.
+Keep the installed mods available until the HTML build finishes. The generated
+viewer then works independently of Steam and the installed game.
+
+The parsers support relative includes, research templates with `key(value)`
+arguments, integer addition/subtraction of template offsets, fractional node
+positions, and implicit starting-unit positions. Missing references, corrupt
+archives, include/dependency cycles, malformed research data, and unsupported
+structures produce warnings. Unusable factions or datasets are skipped; missing
+images use placeholders. Dependencies that are absent or cannot be resolved
+prevent that mod's export. This is a static data viewer: arbitrary mod scripts
+and more complex template expressions are not executed.
+
 Both output directories are replaced on every run. Use `--output` or `--input`
 to select different locations:
 
@@ -231,6 +276,7 @@ deliberately excluded.
 export_research_trees.py       Extract game data and images
 create_research_tree_html.py   Enrich the export and build the viewer
 firepower.py                   Calculate firepower estimates and percentiles
+game_data.py                   Discover Workshop mods and layer resource files
 research_export/               Generated intermediate data (ignored)
 research_tree_html/            Generated website (ignored)
 ```
@@ -240,7 +286,7 @@ research_tree_html/            Generated website (ignored)
 When changing a parser, test against a current unmodified game installation and
 run both stages end to end. Please avoid committing generated game data or assets.
 
-Run the firepower calculation tests with:
+Run the calculation, Workshop overlay, and extraction tests with:
 
 ```bash
 python3 -m unittest discover -s tests -v

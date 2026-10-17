@@ -10,7 +10,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from zipfile import ZipFile
+from game_data import ArchiveView, GameData, Mod, open_archive, warning
 
 from firepower import annotate_firepower
 
@@ -98,10 +98,10 @@ INVENTORY_TYPES = (
 class GameFiles:
     """Game archives needed to enrich the exported research data."""
 
-    vehicle_archive: Path
-    game_logic_archive: Path
-    localization_archive: Path
-    properties_archive: Path
+    vehicle_archive: Path | ArchiveView
+    game_logic_archive: Path | ArchiveView
+    localization_archive: Path | ArchiveView
+    properties_archive: Path | ArchiveView
 
     @classmethod
     def from_game_directory(cls, game_directory: Path) -> "GameFiles":
@@ -140,7 +140,7 @@ def safe_filename(value: str) -> str:
 
 def load_trees(input_dir: Path) -> list[dict]:
     """Load and validate every faction JSON file from the exporter."""
-    json_paths = sorted(input_dir.glob("*.json"))
+    json_paths = sorted(path for path in input_dir.glob("*.json") if path.name != "datasets.json")
     if not json_paths:
         raise RuntimeError(f"No faction JSON files found in {input_dir}")
 
@@ -149,21 +149,26 @@ def load_trees(input_dir: Path) -> list[dict]:
         try:
             tree = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Could not read {path}: {exc}") from exc
+            warning(f"Could not parse {path}: {exc}")
+            continue
 
         faction = tree.get("faction")
         nodes = tree.get("nodes")
         if not faction or not isinstance(nodes, list) or not nodes:
-            raise RuntimeError(f"Invalid or empty research tree in {path}")
+            warning(f"Invalid or empty research tree in {path}")
+            continue
 
         node_ids = [node.get("id") for node in nodes]
         if len(node_ids) != len(set(node_ids)):
-            raise RuntimeError(f"Duplicate node IDs found in {path}")
+            warning(f"Duplicate node IDs found in {path}")
+            continue
 
         tree["source_json"] = path.name
         trees.append(tree)
         log(f"Loaded {faction}: {len(nodes)} nodes")
 
+    if not trees:
+        raise RuntimeError(f"No usable faction JSON files in {input_dir}")
     return trees
 
 
@@ -293,17 +298,17 @@ def load_localizations(localization_archive: Path) -> dict[str, str]:
         raise RuntimeError(f"Localization archive not found: {localization_archive}")
 
     localized: dict[str, str] = {}
-    with ZipFile(localization_archive) as archive:
+    with open_archive(localization_archive) as archive:
         for path in archive.namelist():
-            if not path.endswith(".pot"):
+            if not path.endswith((".pot", ".po")):
                 continue
             text = archive.read(path).decode("utf-8", errors="replace")
             for block in re.split(r"\r?\n\s*\r?\n", text):
                 lines = block.splitlines()
                 context = _po_value(lines, "msgctxt")
-                message = _po_value(lines, "msgid")
+                message = _po_value(lines, "msgstr") or _po_value(lines, "msgid")
                 if context and message:
-                    localized.setdefault(context, message)
+                    localized[context] = message
     return localized
 
 
@@ -466,7 +471,7 @@ def brace_section(text: str, name: str) -> str:
 
 def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
     """Use vehicle road speed or the slowest soldier's maximum sprint speed."""
-    with ZipFile(game_files.properties_archive) as properties:
+    with open_archive(game_files.properties_archive) as properties:
         human = properties.read("properties/human.ext").decode("utf-8", errors="replace")
     human = re.sub(r";[^\r\n]*", "", human)
     running = brace_section(brace_section(human, "Chassis"), "Run")
@@ -475,7 +480,7 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
         raise RuntimeError("Could not resolve infantry sprint speed from properties/human.ext")
     base_speed = float(fast.group(1))
 
-    with ZipFile(game_files.game_logic_archive) as archive:
+    with open_archive(game_files.game_logic_archive) as archive:
         presets = {}
         for path in archive.namelist():
             if path.startswith("set/breed/presets/perks/") and path.endswith(".inc"):
@@ -762,6 +767,30 @@ def annotate_infantry_capabilities(
     )
 
 
+def has_indirect_fire(definition_text: str) -> bool:
+    """Check active entity settings, excluding comments and unused templates."""
+    text = re.sub(r';[^\r\n]*', '', definition_text)
+    # Shared cannon properties declare templates for many weapon types. A
+    # declaration is not an invocation: only the unit's active text is evidence.
+    define = re.compile(r'\(define\s+"[^"]+"')
+    while match := define.search(text):
+        depth = 0
+        end = len(text)
+        for token in re.finditer(r'"(?:\\.|[^"\\])*"|[()]', text[match.start():]):
+            if token[0] == '(':
+                depth += 1
+            elif token[0] == ')':
+                depth -= 1
+                if depth == 0:
+                    end = match.start() + token.end()
+                    break
+        text = text[:match.start()] + text[end:]
+    return bool(re.search(
+        r'"(?:artillery|indirect)_minimap(?:_[^"\r\n]+)?"|\(\s*"abm_dymamic_mortar"(?:\s|\))|\{props[^}]*"mortar"',
+        text, re.IGNORECASE,
+    ))
+
+
 def annotate_unit_metadata(
     trees: list[dict], vehicle_archive: Path, gamelogic_archive: Path,
     localized: dict[str, str],
@@ -772,20 +801,16 @@ def annotate_unit_metadata(
     if not gamelogic_archive.is_file():
         raise RuntimeError(f"Game-logic archive not found: {gamelogic_archive}")
 
-    marker = re.compile(
-        r"(?:artillery|indirect)_minimap|abm_dymamic_mortar|\{props[^}]*\"mortar\"",
-        re.IGNORECASE,
-    )
     at_cannon_marker = re.compile(r'\"(?:detect_atgun|sq_at_gun)\"', re.IGNORECASE)
     indirect_count = 0
     reload_count = 0
     armor_count = 0
     caliber_count = 0
     speed_count = 0
-    with ZipFile(vehicle_archive) as archive, ZipFile(gamelogic_archive) as gamelogic:
+    with open_archive(vehicle_archive) as archive, open_archive(gamelogic_archive) as gamelogic:
         archive_names = set(archive.namelist())
         definitions: dict[str, list[str]] = defaultdict(list)
-        for name in archive_names:
+        for name in sorted(archive_names):
             if name.endswith(".def"):
                 definitions[PurePosixPath(name).stem.lower()].append(name)
 
@@ -793,6 +818,10 @@ def annotate_unit_metadata(
 
         def expanded_definition(name: str, active: set[str] | None = None) -> str:
             if name in expanded_cache:
+                return expanded_cache[name]
+            if isinstance(archive, ArchiveView):
+                # Absolute includes can cross from entity/ into properties/.
+                expanded_cache[name] = archive.data.text(archive.prefix + name)
                 return expanded_cache[name]
             if name not in archive_names:
                 return ""
@@ -804,8 +833,9 @@ def annotate_unit_metadata(
             parts = [text]
             for include in re.findall(r'\(include\s+"([^"]+)"', text):
                 if include.startswith("/"):
-                    continue
-                child = posixpath.normpath(str(PurePosixPath(name).parent / include))
+                    child = include.lstrip("/").removeprefix("entity/")
+                else:
+                    child = posixpath.normpath(str(PurePosixPath(name).parent / include))
                 parts.append(expanded_definition(child, active))
             active.remove(name)
             expanded_cache[name] = "\n".join(parts)
@@ -888,8 +918,8 @@ def annotate_unit_metadata(
             family, capacity = weapon_filling(reference)
             loaded: dict[str, int] = defaultdict(int)
             for match in re.finditer(
-                r'\{(?:weapon|item)\s+"' + re.escape(reference)
-                + r'"\s+(?:filling\s+"([^"]+)"\s+(\d+)|(filled)\b)', text
+                r'\{(?:weapon|item)\s+"(?:weapon\s+)?' + re.escape(reference)
+                + r'"\s+(?:filling\s+"([^"]+)"\s+(\d+)|(filled)\b)', text, re.IGNORECASE
             ):
                 if match.group(1):
                     loaded[ammo_id(match.group(1))] += int(match.group(2))
@@ -933,6 +963,8 @@ def annotate_unit_metadata(
             if cache_key in active:
                 return None, None
             active.add(cache_key)
+            if cache_key not in weapon_files and isinstance(gamelogic, ArchiveView):
+                gamelogic.data.warn(f"Missing weapon reference: {reference}")
 
             for weapon_path in weapon_files.get(reference.lower(), []):
                 text = gamelogic.read(weapon_path).decode("utf-8", errors="replace")
@@ -964,6 +996,43 @@ def annotate_unit_metadata(
             active.remove(cache_key)
             weapon_metadata_cache[cache_key] = (None, None)
             return None, None
+
+        indirect_weapon_cache: dict[str, bool] = {}
+
+        def configured_arc(text: str, active: frozenset = frozenset()) -> bool:
+            text = re.sub(r';[^\r\n]*', '', text)
+            if re.search(r'\{aimtype\s+"?curved"?\s*\}', text, re.IGNORECASE):
+                return True
+            for invocation in re.findall(r'\(\s*"([^"\n]+)"', text):
+                if invocation in {"curved_firing_arc", "indirect_settings", "rocket_artillery"}:
+                    return True
+                if invocation in preset_blocks and invocation not in active:
+                    body = re.sub(r'^\(define\s+"[^"]+"', '', preset_blocks[invocation])
+                    if configured_arc(body, active | {invocation}):
+                        return True
+            return False
+
+        def weapon_indirect_fire(reference: str, active: frozenset = frozenset()) -> bool:
+            reference = re.sub(r'^weapon\s+', '', reference.strip(), flags=re.IGNORECASE).lower()
+            if reference in indirect_weapon_cache:
+                return indirect_weapon_cache[reference]
+            if reference in active:
+                return False
+            paths = weapon_files.get(reference, [])
+            # These lobbed-fire weapons share generic RPG/rocket patterns
+            # without a distinguishing indirect aimtype. Children inherit it.
+            capable = bool(paths) and reference in {"piat", "380mm_rw61"}
+            for path in paths:
+                text = re.sub(r';[^\r\n]*', '', gamelogic.read(path).decode(errors="replace"))
+                capable = capable or configured_arc(text)
+                parent = re.search(r'\{from\s+"([^"]+)"', text)
+                if parent:
+                    name = parent[1]
+                    if name.startswith("pattern "):
+                        name = name.removeprefix("pattern ") + ".pattern"
+                    capable = capable or weapon_indirect_fire(name, active | {reference})
+            indirect_weapon_cache[reference] = capable
+            return capable
 
         fire_rate_cache: dict[str, float | None] = {}
 
@@ -1043,11 +1112,12 @@ def annotate_unit_metadata(
                 for lookup_id in lookup_ids:
                     definition_paths.extend(definitions.get(lookup_id.lower(), []))
                 definition_paths = list(dict.fromkeys(definition_paths))
+                if unit.get("vehicle") and not definition_paths and isinstance(archive, ArchiveView):
+                    archive.data.warn(f"{tree['faction']}/{node['id']}: missing vehicle definition {unit['vehicle']}")
                 definition_text = "\n".join(expanded_definition(path) for path in definition_paths)
-                node["indirect_fire"] = bool(marker.search(definition_text))
+                entity_indirect_fire = has_indirect_fire(definition_text)
+                node["indirect_fire"] = entity_indirect_fire
                 node["at_cannon"] = bool(at_cannon_marker.search(definition_text))
-                if node["indirect_fire"]:
-                    indirect_count += 1
 
                 weapon_text = re.sub(r";[^\r\n]*", "", definition_text)
                 weapon_references = re.findall(r'\{weapon\s+"([^"]+)"', weapon_text)
@@ -1056,6 +1126,12 @@ def annotate_unit_metadata(
                 weapon_references.extend(re.findall(
                     r'\{item\s+"([^"]+)"[^{}]*\{user\s+"[^"]+"\}', weapon_text
                 ))
+                # The engine accepts both "gun_id" and "weapon gun_id".
+                # Normalize before lookup, counting mounts, and choosing a gun.
+                weapon_references = [
+                    re.sub(r'^weapon\s+', '', reference.strip(), flags=re.IGNORECASE).lower()
+                    for reference in weapon_references
+                ]
                 weapon_mount_counts = {
                     reference: weapon_references.count(reference)
                     for reference in weapon_references
@@ -1122,9 +1198,23 @@ def annotate_unit_metadata(
                 node["unit_class"] = classify_unit(
                     unit,
                     definition_paths,
-                    indirect_fire=node["indirect_fire"],
+                    indirect_fire=entity_indirect_fire,
                     at_cannon=node["at_cannon"],
                 )
+
+                # Capability is independent of the unit's role: a PIAT squad
+                # remains infantry and a howitzer tank remains a tank.
+                carried_weapons = [
+                    weapon["id"] for member in node.get("members") or []
+                    if member.get("count", 0) > 0
+                    for weapon in member.get("weapons") or []
+                ] if node["unit_class"] == "infantry" else []
+                node["indirect_fire"] = entity_indirect_fire or any(
+                    weapon_indirect_fire(reference)
+                    for reference in [*weapon_references, *carried_weapons]
+                )
+                if node["indirect_fire"]:
+                    indirect_count += 1
 
                 primary_capacities = []
                 if node["vehicle_weapons"]:
@@ -1177,7 +1267,7 @@ def convert_images(trees: list[dict], input_dir: Path, output_dir: Path) -> tupl
 
     for tree in trees:
         faction = tree["faction"]
-        faction_dir = assets_dir / safe_filename(faction)
+        faction_dir = assets_dir / (tree.get("mod_id") or "base") / safe_filename(faction)
         faction_dir.mkdir(parents=True, exist_ok=True)
 
         for node in tree["nodes"]:
@@ -1203,9 +1293,10 @@ def convert_images(trees: list[dict], input_dir: Path, output_dir: Path) -> tupl
                 with Image.open(source) as image:
                     image.convert("RGBA").save(target, format="PNG", optimize=True)
             except (OSError, ValueError) as exc:
-                raise RuntimeError(f"Could not convert {source}: {exc}") from exc
+                missing.append(f"{faction}/{node['id']} (image parsing error: {exc})")
+                continue
 
-            node["web_image"] = f"assets/{safe_filename(faction)}/{target_name}"
+            node["web_image"] = target.relative_to(output_dir).as_posix()
             converted += 1
 
     return converted, missing
@@ -1257,26 +1348,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    game_resource_dir = args.game_path.resolve()
-    input_dir = args.input.resolve()
-    output_dir = args.output.resolve()
-    game_files = GameFiles.from_game_directory(game_resource_dir)
-    missing_files = [str(path) for path in game_files.missing()]
-    if missing_files:
-        raise RuntimeError(f"Required game file(s) not found: {', '.join(missing_files)}")
-    if not input_dir.is_dir():
-        raise RuntimeError(
-            f"Input directory does not exist: {input_dir}. "
-            "Run export_research_trees.py first."
-        )
-    if output_dir in (input_dir, game_resource_dir, SCRIPT_DIR):
-        raise RuntimeError(
-            "Output directory must differ from the input and game resource directories"
-        )
-
-    trees = load_trees(input_dir)
+def enrich_trees(trees: list[dict], game_files: GameFiles) -> None:
     root_count, branch_node_count = annotate_research_branches(trees)
     log(
         f"Classified {root_count} research roots and propagated branch types "
@@ -1302,7 +1374,7 @@ def main() -> None:
     )
     log(
         f"Detected indirect-fire capability on {indirect_count} research nodes "
-        "from game entity definitions"
+        "from entity and weapon definitions"
     )
     log(f"Resolved primary-weapon reload time for {reload_count} research nodes")
     log(f"Resolved frontal armor thickness for {armor_count} research nodes")
@@ -1315,6 +1387,54 @@ def main() -> None:
     log(f"Resolved unit movement speed for {unit_speed_count} research nodes")
     annotate_firepower(trees)
     log("Calculated firepower estimates and comparison-group percentiles")
+
+
+def main() -> None:
+    args = parse_args()
+    game_resource_dir = args.game_path.resolve()
+    input_dir = args.input.resolve()
+    output_dir = args.output.resolve()
+    game_files = GameFiles.from_game_directory(game_resource_dir)
+    missing_files = [str(path) for path in game_files.missing()]
+    if missing_files:
+        raise RuntimeError(f"Required game file(s) not found: {', '.join(missing_files)}")
+    if not input_dir.is_dir():
+        raise RuntimeError(
+            f"Input directory does not exist: {input_dir}. "
+            "Run export_research_trees.py first."
+        )
+    if output_dir in (input_dir, game_resource_dir, SCRIPT_DIR):
+        raise RuntimeError(
+            "Output directory must differ from the input and game resource directories"
+        )
+
+    manifest = input_dir / "datasets.json"
+    datasets = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else [
+        {"id": "", "name": "None", "directory": ".", "layers": []}
+    ]
+    trees = []
+    for dataset in datasets:
+        try:
+            dataset_dir = (input_dir / dataset["directory"]).resolve()
+            dataset_dir.relative_to(input_dir)
+            group = load_trees(dataset_dir)
+            layers = [Mod(item["id"], item["name"], Path(item["path"]),
+                          tuple(item.get("requires", [])), tuple(item.get("deletes", [])))
+                      for item in dataset.get("layers", [])]
+            with GameData(game_resource_dir, layers) as data:
+                views = GameFiles(data.view("entity/"), data.view(), data.view(), data.view())
+                enrich_trees(group, views)
+            for tree in group:
+                tree["mod_id"] = dataset["id"]
+                tree["mod_name"] = dataset["name"]
+                for node in tree["nodes"]:
+                    if node.get("image"):
+                        node["image"]["path"] = (Path(dataset["directory"]) / node["image"]["path"]).as_posix()
+            trees.extend(group)
+        except (OSError, ValueError, KeyError, RuntimeError, IndexError) as exc:
+            warning(f"Skipping dataset {dataset['name']}: parsing error or missing reference: {exc}")
+    if not trees:
+        raise RuntimeError("No usable research datasets found")
     if output_dir.exists():
         old_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
         log(f"Removing existing {output_dir} ({old_files} files)")
@@ -1350,7 +1470,6 @@ button, select, input { color: inherit; background: #252b2e; border: 1px solid #
 button { cursor: pointer; }
 button:hover { background: #343c40; }
 #toolbar { height: 54px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; }
-#toolbar h1 { font-size: 17px; margin: 0 14px 0 0; white-space: nowrap; }
 #search { width: min(260px, 24vw); }
 #hint { margin-left: auto; color: #9ca6a8; font-size: 12px; }
 #filter-panel { position: absolute; z-index: 12; left: 0; top: 54px; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
@@ -1481,12 +1600,14 @@ html[data-theme="light"] .comparison .comparison-section th { background: #dce3d
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
 @media (max-width: 1000px) { #hint { display: none; } }
-@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } #toolbar h1 { display: none; } }
+@media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } }
 </style>
 </head>
 <body>
 <header id="toolbar">
-  <h1>Research Trees</h1>
+  <label for="mod">Mod</label>
+  <select id="mod" aria-label="Mod" style="max-width:260px" title="Steam Workshop mod"></select>
+  <label for="faction">Faction</label>
   <select id="faction" aria-label="Faction"></select>
   <input id="search" type="search" placeholder="Find a unit…" aria-label="Find a unit">
   <button id="zoom-out" title="Zoom out">−</button>
@@ -1506,12 +1627,12 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   <h2 class="filter-heading">Highlight filters</h2>
   <details class="filter-group" id="general-filter" open>
     <summary>General</summary>
+    <label>Max command points (CP) <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
+    <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
     <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Unit speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
-    <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
-    <label>Max command points <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
   </details>
   <details class="filter-group" id="infantry-filter">
     <summary>Infantry</summary>
@@ -1573,6 +1694,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const detailContent = document.getElementById('detail-content');
   const statsResize = document.getElementById('stats-resize');
   let selectedNodeId = null, statsWidth = 560, statsDrag = null;
+  const modSelect = document.getElementById('mod');
   const factionSelect = document.getElementById('faction');
   const themeButton = document.getElementById('theme');
   const minSizeInput = document.getElementById('min-size');
@@ -1685,12 +1807,28 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   try { initialTheme = localStorage.getItem('research-tree-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); } catch (_) {}
   applyTheme(initialTheme);
 
-  for (const item of trees) {
+  const mods = new Map([['', 'None']]);
+  for (const item of trees) mods.set(item.mod_id || '', item.mod_name || 'None');
+  for (const [id, name] of mods) {
     const option = document.createElement('option');
-    option.value = item.faction;
-    option.textContent = item.faction.toUpperCase();
-    factionSelect.append(option);
+    option.value = id;
+    option.textContent = name;
+    modSelect.append(option);
   }
+  modSelect.value = '';
+
+  function updateFactions() {
+    const previous = factionSelect.value;
+    factionSelect.replaceChildren();
+    for (const item of trees.filter(item => (item.mod_id || '') === modSelect.value)) {
+      const option = document.createElement('option');
+      option.value = item.faction;
+      option.textContent = item.faction.toUpperCase();
+      factionSelect.append(option);
+    }
+    if ([...factionSelect.options].some(option => option.value === previous)) factionSelect.value = previous;
+  }
+  updateFactions();
 
   const weaponRoleLabels = {
     'rifle': 'Rifle', 'submachine-gun': 'Submachine gun',
@@ -1812,7 +1950,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   function nodePosition(node) { return layoutPositions?.get(node.id) || originalNodePosition(node); }
 
   function renderTree(faction) {
-    tree = trees.find(item => item.faction === faction);
+    tree = trees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
     updateInfantryWeaponOptions();
     byId = new Map(tree.nodes.map(node => [node.id, node]));
     layoutPositions = new Map(
@@ -2314,6 +2452,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     if (panMoved) { panMoved = false; return; }
     if (event.target === viewport || event.target === world || event.target === nodesLayer) clearHighlighting();
   });
+  modSelect.addEventListener('change', () => {
+    updateFactions();
+    renderTree(factionSelect.value);
+  });
   factionSelect.addEventListener('change', () => renderTree(factionSelect.value));
   document.getElementById('clear').addEventListener('click', clearHighlighting);
   document.getElementById('close-details').addEventListener('click', closeStatsPanel);
@@ -2362,7 +2504,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     if (details.hidden) fitTree();
     else resizeStatsPanel(statsWidth);
   });
-  renderTree(trees[0].faction);
+  renderTree(factionSelect.value);
 })();
 </script>
 </body>

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 
+from game_data import GameData, discover_mods, mod_layers, expand_defines, warning
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "research_export"
@@ -78,6 +80,11 @@ def discover_factions(gamelogic_zip: ZipFile) -> list[str]:
 
 
 def read_text(zf: ZipFile, name: str) -> str:
+    if hasattr(zf, "data"):
+        text = zf.data.text(zf.prefix + name)
+        if "unit_research_" in name:
+            return expand_defines(text, zf.data.warn)
+        return text
     return zf.read(name).decode("utf-8", errors="replace")
 
 
@@ -143,14 +150,14 @@ def parse_token_map(text: str) -> dict[str, list[str]]:
 def parse_research_entries(text: str) -> list[dict]:
     """Parse the compact research-node records from a faction research file."""
     entries = []
-    section_pattern = re.compile(r"^;\/\/---(.+?)---\s*$", re.MULTILINE)
+    section_pattern = re.compile(r"^;\s*(?://)?---(.+?)---\s*$", re.MULTILINE)
     sections = [
         (match.start(), match.group(1).strip())
         for match in section_pattern.finditer(text)
     ]
     pattern = re.compile(
         r'\{\s*(tech\s+)?"([^"]+)"\s*requires\s*"([^"]*)"'
-        r"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+)\s+(-?\d+)\s*\}"
+        r"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\}"
     )
     for match in pattern.finditer(text):
         research_section = next(
@@ -163,10 +170,17 @@ def parse_research_entries(text: str) -> list[dict]:
                 "node_type": "tech" if match.group(1) else "unit",
                 "requires": [item for item in match.group(3).split() if item],
                 "cost": float(match.group(4)),
-                "position": {"x": int(match.group(5)), "y": int(match.group(6))},
+                "position": {"x": float(match.group(5)), "y": float(match.group(6))},
                 "research_section": research_section,
             }
         )
+    node_ids = {entry["id"] for entry in entries}
+    positions = _section_text(text, "positions")
+    for identifier, x, y in re.findall(r'\{\s*"([^"]+)"\s+(-?[0-9.]+)\s+(-?[0-9.]+)\s*\}', positions):
+        if identifier not in node_ids:
+            entries.append({"id": identifier, "node_type": "unit", "requires": [], "cost": 0,
+                            "position": {"x": float(x), "y": float(y)}, "research_section": "SQUADS"})
+            node_ids.add(identifier)
     return entries
 
 
@@ -207,6 +221,7 @@ def parse_breed_declarations(text: str) -> dict[str, dict]:
 
 def parse_infantry_role_command_points(text: str) -> dict[str, int | float]:
     """Read the per-soldier CP values inherited by infantry roster declarations."""
+    text = re.sub(r';[^\r\n]*', '', text)
     command_points: dict[str, int | float] = {}
     for match in re.finditer(r'\(define\s+"([^"]+)"', text):
         start = match.start()
@@ -384,20 +399,37 @@ def choose_image(
     return None, None
 
 
+def active_roster(data):
+    if hasattr(data, "roster_text"):
+        return data.roster_text
+    root = "set/multiplayer/units/roster_conquest.set"
+    if root not in data.files:
+        data.roster_text = None
+        return None
+    text = data.text(root).strip()
+    text, stripped = re.subn(r'^\s*(?:;[^\n]*\n\s*)*\{units\b', '', text, count=1)
+    if stripped:
+        text = text.rsplit("}", 1)[0]
+    data.roster_text = text
+    return text
+
+
 def build_unit_lookup(
     faction: str, gamelogic_zip: ZipFile
 ) -> tuple[dict[str, str], dict[str, dict], dict[str, list[str]]]:
     """Load unit definitions, soldier declarations, and breed file locations."""
-    inf_text = read_text(gamelogic_zip, ROSTER_INF_PATH_TEMPLATE.format(faction=faction))
-    units_text = read_text(gamelogic_zip, ROSTER_UNIT_PATH_TEMPLATE.format(faction=faction))
+    roster = active_roster(gamelogic_zip.data) if hasattr(gamelogic_zip, "data") else None
+    inf_text = roster if roster is not None else read_text(gamelogic_zip, ROSTER_INF_PATH_TEMPLATE.format(faction=faction))
+    units_text = "" if roster is not None else read_text(gamelogic_zip, ROSTER_UNIT_PATH_TEMPLATE.format(faction=faction))
 
+    breed_declarations = parse_breed_declarations(inf_text)
+    inf_text = re.sub(r';[^\r\n]*', '', inf_text)
+    units_text = re.sub(r';[^\r\n]*', '', units_text)
     unit_blocks = {}
     unit_blocks.update(extract_named_blocks(inf_text))
     unit_blocks.update(extract_named_blocks(units_text))
     unit_blocks.update(extract_named_tuples(inf_text))
     unit_blocks.update(extract_named_tuples(units_text))
-
-    breed_declarations = parse_breed_declarations(inf_text)
 
     breed_paths: dict[str, list[str]] = defaultdict(list)
     for name in gamelogic_zip.namelist():
@@ -578,7 +610,7 @@ def describe_unit_members(
     return details, total_cost, resolved_breed_count
 
 
-def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) -> None:
+def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *, quiet: bool = False) -> None:
     """Export every faction tree and its images into ``output_dir``."""
     game_resource_dir = game_resource_dir.resolve()
     output_dir = output_dir.resolve()
@@ -602,9 +634,9 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
     replace_output_directory(output_dir, quiet=quiet)
 
     with (
-        ZipFile(archives.game_logic) as gamelogic_zip,
-        ZipFile(archives.interface_scene) as scene_zip,
-        ZipFile(archives.interface_pages) as pages_zip,
+        data.view() as gamelogic_zip,
+        data.view("interface/") as scene_zip,
+        data.view("interface/") as pages_zip,
     ):
         scene_names = set(scene_zip.namelist())
         pages_names = set(pages_zip.namelist())
@@ -620,12 +652,12 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
         )
         log(f"Discovered {len(factions)} factions: {', '.join(factions)}", quiet=quiet)
 
-        if CONQUEST_INF_SETTINGS_PATH not in gamelogic_names:
+        if CONQUEST_INF_SETTINGS_PATH not in gamelogic_names and active_roster(data) is None:
             raise RuntimeError(
                 f"Required infantry settings not found: {CONQUEST_INF_SETTINGS_PATH}"
             )
         infantry_role_cp = parse_infantry_role_command_points(
-            read_text(gamelogic_zip, CONQUEST_INF_SETTINGS_PATH)
+            active_roster(data) or read_text(gamelogic_zip, CONQUEST_INF_SETTINGS_PATH)
         )
         if not infantry_role_cp:
             raise RuntimeError(
@@ -641,148 +673,167 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
         total_images = 0
 
         for faction_index, faction in enumerate(factions, start=1):
-            research_path = RESEARCH_PATH_TEMPLATE.format(faction=faction)
-            roster_inf_path = ROSTER_INF_PATH_TEMPLATE.format(faction=faction)
-            roster_unit_path = ROSTER_UNIT_PATH_TEMPLATE.format(faction=faction)
-            missing_inputs = [
-                path
-                for path in (research_path, roster_inf_path, roster_unit_path)
-                if path not in gamelogic_names
-            ]
-            if missing_inputs:
-                raise RuntimeError(
-                    f"Faction {faction!r} is missing required game data: {', '.join(missing_inputs)}"
-                )
-
-            log(f"[{faction_index}/{len(factions)}] Exporting {faction}", quiet=quiet)
-            research_text = read_text(gamelogic_zip, research_path)
-            unit_blocks, breed_declarations, breed_paths = build_unit_lookup(faction, gamelogic_zip)
-            entries = parse_research_entries(research_text)
-            if not entries:
-                raise RuntimeError(f"No research nodes parsed from {research_path}")
-            log(
-                f"  Parsed {len(entries)} research nodes, {len(unit_blocks)} roster definitions, "
-                f"and {len(breed_declarations)} breed declarations",
-                quiet=quiet,
-            )
-
-            out = {
-                "faction": faction,
-                "source": {
-                    "research_file": research_path,
-                    "roster_inf_file": roster_inf_path,
-                    "roster_unit_file": roster_unit_path,
-                    "infantry_settings_file": CONQUEST_INF_SETTINGS_PATH,
-                    "archives": [
-                        archives.game_logic.name,
-                        archives.interface_scene.name,
-                        archives.interface_pages.name,
-                    ],
-                },
-                "nodes": [],
-            }
-
-            resolved_units = 0
-            resolved_breeds = 0
-            exported_images = 0
-            missing_unit_ids = []
-            missing_image_ids = []
-
-            for entry in entries:
-                unit_info = None
-                lookup_id = entry["id"]
-                if lookup_id not in unit_blocks:
-                    lookup_id = normalize_node_lookup_id(entry["id"])
-                if lookup_id in unit_blocks:
-                    unit_info = parse_unit_block(entry["id"], unit_blocks[lookup_id])
-                    resolved_units += 1
-                elif entry["node_type"] == "unit":
-                    missing_unit_ids.append(entry["id"])
-
-                member_details = []
-                total_member_cost = 0.0
-                if unit_info:
-                    member_details, total_member_cost, breed_count = describe_unit_members(
-                        unit_info,
-                        breed_declarations,
-                        breed_paths,
-                        infantry_role_cp,
-                        gamelogic_zip,
+            try:
+                research_path = RESEARCH_PATH_TEMPLATE.format(faction=faction)
+                roster_inf_path = ROSTER_INF_PATH_TEMPLATE.format(faction=faction)
+                roster_unit_path = ROSTER_UNIT_PATH_TEMPLATE.format(faction=faction)
+                missing_inputs = [
+                    path
+                    for path in (research_path, roster_inf_path, roster_unit_path)
+                    if path not in gamelogic_names and active_roster(data) is None
+                ]
+                if missing_inputs:
+                    raise RuntimeError(
+                        f"Faction {faction!r} is missing required game data: {', '.join(missing_inputs)}"
                     )
-                    resolved_breeds += breed_count
 
-                image_source, image_bytes = choose_image(
-                    scene_zip,
-                    pages_zip,
-                    scene_names,
-                    pages_names,
-                    entry["id"],
-                    [detail["breed_file"] for detail in member_details if detail.get("breed_file")],
-                )
-
-                image_ref = None
-                if image_source and image_bytes:
-                    ext = Path(image_source).suffix
-                    filename = f"{sanitize_filename(entry['id'])}{ext}"
-                    relative_path = Path("images") / faction / filename
-                    target = output_dir / relative_path
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(image_bytes)
-                    image_ref = str(relative_path)
-                    exported_images += 1
-                else:
-                    missing_image_ids.append(entry["id"])
-
-                out["nodes"].append(
-                    {
-                        **entry,
-                        "display_name": prettify_name(entry["id"]),
-                        "image": {
-                            "path": image_ref,
-                            "source_asset": image_source,
-                        }
-                        if image_ref
-                        else None,
-                        "unit": unit_info,
-                        "members": member_details or None,
-                        "stats": {
-                            "unit_count": unit_info["unit_count"] if unit_info else None,
-                            "command_points": unit_info["cp"] if unit_info else None,
-                            "member_cost_total": total_member_cost if member_details else None,
-                            "member_cost_average": (
-                                round(total_member_cost / unit_info["unit_count"], 2)
-                                if member_details and unit_info and unit_info["unit_count"]
-                                else None
-                            ),
-                        },
-                    }
-                )
-
-            out["nodes"].sort(
-                key=lambda node: (
-                    node["position"]["y"],
-                    node["position"]["x"],
-                    node["id"],
-                )
-            )
-            json_path = output_dir / f"{faction}.json"
-            json_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
-            total_nodes += len(entries)
-            total_images += exported_images
-
-            log(
-                f"  Resolved {resolved_units}/{len(entries)} nodes to units, "
-                f"{resolved_breeds} member breed files, and {exported_images}/{len(entries)} images",
-                quiet=quiet,
-            )
-            if missing_unit_ids:
+                log(f"[{faction_index}/{len(factions)}] Exporting {faction}", quiet=quiet)
+                research_text = read_text(gamelogic_zip, research_path)
+                unit_blocks, breed_declarations, breed_paths = build_unit_lookup(faction, gamelogic_zip)
+                entries = parse_research_entries(research_text)
+                records = len(re.findall(r'\{\s*(?:tech\s+)?"[^"]+"\s*requires', research_text))
+                if records > len(entries):
+                    data.warn(f"{research_path}: unsupported or malformed research records ({records} records, {len(entries)} parsed)")
+                unique = {entry["id"]: entry for entry in entries}
+                if len(unique) != len(entries):
+                    data.warn(f"{research_path}: duplicate node IDs; last definition wins")
+                entries = list(unique.values())
+                if not entries:
+                    raise RuntimeError(f"No research nodes parsed from {research_path}")
                 log(
-                    f"  WARNING: unit definitions not found: {', '.join(missing_unit_ids)}",
+                    f"  Parsed {len(entries)} research nodes, {len(unit_blocks)} roster definitions, "
+                    f"and {len(breed_declarations)} breed declarations",
                     quiet=quiet,
                 )
-            if missing_image_ids:
-                log(f"  WARNING: images not found: {', '.join(missing_image_ids)}", quiet=quiet)
-            log(f"  Wrote {json_path} ({json_path.stat().st_size:,} bytes)", quiet=quiet)
+
+                out = {
+                    "faction": faction,
+                    "source": {
+                        "research_file": research_path,
+                        "roster_inf_file": roster_inf_path,
+                        "roster_unit_file": roster_unit_path,
+                        "infantry_settings_file": CONQUEST_INF_SETTINGS_PATH,
+                        "archives": [
+                            archives.game_logic.name,
+                            archives.interface_scene.name,
+                            archives.interface_pages.name,
+                        ],
+                    },
+                    "nodes": [],
+                }
+
+                resolved_units = 0
+                resolved_breeds = 0
+                exported_images = 0
+                missing_unit_ids = []
+                missing_image_ids = []
+
+                for entry in entries:
+                    unit_info = None
+                    lookup_id = entry["id"]
+                    if lookup_id not in unit_blocks:
+                        lookup_id = normalize_node_lookup_id(entry["id"])
+                    if lookup_id in unit_blocks:
+                        unit_info = parse_unit_block(entry["id"], unit_blocks[lookup_id])
+                        resolved_units += 1
+                    elif entry["node_type"] == "unit":
+                        missing_unit_ids.append(entry["id"])
+
+                    member_details = []
+                    total_member_cost = 0.0
+                    if unit_info:
+                        member_details, total_member_cost, breed_count = describe_unit_members(
+                            unit_info,
+                            breed_declarations,
+                            breed_paths,
+                            infantry_role_cp,
+                            gamelogic_zip,
+                        )
+                        resolved_breeds += breed_count
+
+                    image_source, image_bytes = choose_image(
+                        scene_zip,
+                        pages_zip,
+                        scene_names,
+                        pages_names,
+                        entry["id"],
+                        [detail["breed_file"] for detail in member_details if detail.get("breed_file")],
+                    )
+
+                    image_ref = None
+                    if image_source and image_bytes:
+                        ext = Path(image_source).suffix
+                        filename = f"{sanitize_filename(entry['id'])}{ext}"
+                        relative_path = Path("images") / faction / filename
+                        target = output_dir / relative_path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(image_bytes)
+                        image_ref = str(relative_path)
+                        exported_images += 1
+                    else:
+                        missing_image_ids.append(entry["id"])
+
+                    out["nodes"].append(
+                        {
+                            **entry,
+                            "display_name": prettify_name(entry["id"]),
+                            "image": {
+                                "path": image_ref,
+                                "source_asset": image_source,
+                            }
+                            if image_ref
+                            else None,
+                            "unit": unit_info,
+                            "members": member_details or None,
+                            "stats": {
+                                "unit_count": unit_info["unit_count"] if unit_info else None,
+                                "command_points": unit_info["cp"] if unit_info else None,
+                                "member_cost_total": total_member_cost if member_details else None,
+                                "member_cost_average": (
+                                    round(total_member_cost / unit_info["unit_count"], 2)
+                                    if member_details and unit_info and unit_info["unit_count"]
+                                    else None
+                                ),
+                            },
+                        }
+                    )
+
+                node_ids = {node["id"] for node in out["nodes"]}
+                for node in out["nodes"]:
+                    for required in node["requires"]:
+                        if required not in node_ids:
+                            data.warn(f"{faction}/{node['id']}: missing prerequisite {required}")
+                    for member in node.get("members") or []:
+                        if not member.get("breed_file"):
+                            data.warn(f"{faction}/{node['id']}: missing breed {member['alias']}")
+
+                out["nodes"].sort(
+                    key=lambda node: (
+                        node["position"]["y"],
+                        node["position"]["x"],
+                        node["id"],
+                    )
+                )
+                json_path = output_dir / f"{faction}.json"
+                json_path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+                total_nodes += len(entries)
+                total_images += exported_images
+
+                log(
+                    f"  Resolved {resolved_units}/{len(entries)} nodes to units, "
+                    f"{resolved_breeds} member breed files, and {exported_images}/{len(entries)} images",
+                    quiet=quiet,
+                )
+                if missing_unit_ids:
+                    log(
+                        f"  WARNING: unit definitions not found: {', '.join(missing_unit_ids)}",
+                        quiet=quiet,
+                    )
+                if missing_image_ids:
+                    log(f"  WARNING: images not found: {', '.join(missing_image_ids)}", quiet=quiet)
+                log(f"  Wrote {json_path} ({json_path.stat().st_size:,} bytes)", quiet=quiet)
+            except (OSError, KeyError, ValueError, RuntimeError, IndexError) as exc:
+                warning(f"Skipping faction {faction}: parsing error or missing reference: {exc}")
 
     output_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
     log(
@@ -790,6 +841,30 @@ def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) ->
         f"across {len(factions)} factions ({output_files:,} files total)",
         quiet=quiet,
     )
+
+
+def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) -> None:
+    """Export the base game and each installed mod as separate selectable datasets."""
+    mods = discover_mods(game_resource_dir)
+    log(f"Detected {len(mods)} Workshop mods", quiet=quiet)
+    with GameData(game_resource_dir) as data:
+        export_dataset(game_resource_dir, output_dir, data, quiet=quiet)
+    datasets = [{"id": "", "name": "None", "directory": ".", "layers": []}]
+    for mod in mods:
+        try:
+            layers = mod_layers(mod, mods)
+            log(f"Mod: {mod.name}; load order: {' -> '.join(item.name for item in layers)}", quiet=quiet)
+            directory = Path("mods") / mod.id
+            with GameData(game_resource_dir, layers) as data:
+                export_dataset(game_resource_dir, output_dir / directory, data, quiet=quiet)
+            if not list((output_dir / directory).glob("*.json")):
+                warning(f"No usable research trees for {mod.name}")
+                continue
+            datasets.append({**mod.metadata(), "directory": directory.as_posix(),
+                             "layers": [item.metadata() for item in layers]})
+        except (OSError, KeyError, ValueError, RuntimeError) as exc:
+            warning(f"Skipping mod {mod.name}: {exc}")
+    (output_dir / "datasets.json").write_text(json.dumps(datasets, indent=2) + "\n", encoding="utf-8")
 
 
 def parse_args() -> object:
