@@ -154,7 +154,7 @@ def documents_dir() -> Path:
         try:
             match = re.search(r'^XDG_DOCUMENTS_DIR="([^"]+)"', config.read_text(), re.MULTILINE)
             if match:
-                path = Path(match.group(1).replace("$HOME", str(home)))
+                path = Path(match.group(1).replace("${HOME}", str(home)).replace("$HOME", str(home)))
                 if path.is_dir():
                     return path
         except OSError:
@@ -370,7 +370,17 @@ def run_gui(game_path: Path | None, output_dir: Path) -> int:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def close() -> None:
+        building = str(build_button.cget("state")) == "disabled"
+        if building and not messagebox.askokcancel(
+                "Build running", "A build is still running. Quit anyway?", parent=root):
+            return
+        if building:
+            result["code"] = 1
+        root.destroy()
+
     build_button.configure(command=build)
+    root.protocol("WM_DELETE_WINDOW", close)
     poll()
     root.mainloop()
     return 0 if result["code"] in (None, 0) else result["code"]

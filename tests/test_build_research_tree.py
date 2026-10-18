@@ -64,6 +64,15 @@ class LauncherTests(unittest.TestCase):
         (self.root / 'documents/index.html').write_text(launcher.OUTPUT_SIGNATURE)
         self.assertIsNone(launcher.check_output_dir(self.root / 'documents', resource))
 
+    def test_command_line_rejects_missing_game_and_unsafe_output(self):
+        with patch('builtins.print'):
+            self.assertEqual(launcher.main(['--game-path', str(self.root)]), 2)
+            resource = self.root / 'Game/resource'
+            resource.mkdir(parents=True)
+            (resource / 'gamelogic.pak').touch()
+            self.assertEqual(launcher.main(['--game-path', str(self.root / 'Game'),
+                                            '--output', str(Path.home())]), 2)
+
     def test_command_line_build_runs_both_scripts(self):
         image = io.BytesIO()
         Image.new('RGB', (2, 2), 'red').save(image, format='PNG')
