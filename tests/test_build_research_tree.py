@@ -53,12 +53,15 @@ class LauncherTests(unittest.TestCase):
         resource.mkdir(parents=True)
         self.assertIsNone(launcher.check_output_dir(self.root / 'new', resource))
         self.assertIsNotNone(launcher.check_output_dir(Path.home(), resource))
+        self.assertIsNotNone(launcher.check_output_dir(Path.home().parent, resource))
         self.assertIsNotNone(launcher.check_output_dir(self.root / 'Game/out', resource))
         self.assertIsNotNone(launcher.check_output_dir(self.root, resource))
         (self.root / 'documents').mkdir()
         (self.root / 'documents/notes.txt').write_text('keep')
         self.assertIn('not empty', launcher.check_output_dir(self.root / 'documents', resource))
-        (self.root / 'documents/index.html').touch()
+        (self.root / 'documents/index.html').write_text('<html>unrelated</html>')
+        self.assertIn('not empty', launcher.check_output_dir(self.root / 'documents', resource))
+        (self.root / 'documents/index.html').write_text(launcher.OUTPUT_SIGNATURE)
         self.assertIsNone(launcher.check_output_dir(self.root / 'documents', resource))
 
     def test_command_line_build_runs_both_scripts(self):
@@ -81,7 +84,7 @@ class LauncherTests(unittest.TestCase):
         with patch('builtins.print', side_effect=lambda line, **_: lines.append(line)):
             code = launcher.main(['--game-path', str(self.root / 'Game'), '--output', str(output)])
         self.assertEqual(code, 0, '\n'.join(lines))
-        self.assertTrue((output / 'index.html').is_file())
+        self.assertTrue(launcher.is_previous_output(output))
 
 
 if __name__ == '__main__':

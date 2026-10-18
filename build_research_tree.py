@@ -29,6 +29,7 @@ STEAM_APP_ID = "400750"
 GAME_FOLDER_NAME = "Call to Arms - Gates of Hell"
 OUTPUT_FOLDER_NAME = "Gates of Hell Research Tree"
 MARKER_FILE = "gamelogic.pak"
+OUTPUT_SIGNATURE = "<title>Gates of Hell Research Trees</title>"
 
 
 def resolve_resource_dir(path: Path | str | None) -> Path | None:
@@ -124,7 +125,8 @@ def find_game_resource_dirs(home: Path | None = None) -> list[Path]:
         folder = GAME_FOLDER_NAME
         manifest = library / f"appmanifest_{STEAM_APP_ID}.acf"
         try:
-            match = re.search(r'"installdir"\s+"([^"]+)"', manifest.read_text(errors="replace"))
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r'"installdir"\s+"([^"]+)"', text)
             if match:
                 folder = match.group(1)
         except OSError:
@@ -165,12 +167,20 @@ def default_output_dir() -> Path:
     return documents_dir() / OUTPUT_FOLDER_NAME
 
 
+def is_previous_output(directory: Path) -> bool:
+    try:
+        with (directory / "index.html").open(encoding="utf-8", errors="replace") as handle:
+            return OUTPUT_SIGNATURE in handle.read(4096)
+    except OSError:
+        return False
+
+
 def check_output_dir(output_dir: Path, resource_dir: Path | None = None) -> str | None:
     """Return why output_dir must not be replaced, or None when it is safe."""
     output_dir = output_dir.expanduser().resolve()
-    protected = {Path.home().resolve(), SCRIPT_DIR, Path(output_dir.anchor)}
-    if output_dir in protected:
-        return f"Choose a dedicated output folder, not {output_dir}"
+    for protected in (Path.home().resolve(), SCRIPT_DIR, Path(output_dir.anchor)):
+        if output_dir == protected or output_dir in protected.parents:
+            return f"Choose a dedicated output folder, not {output_dir}"
     if resource_dir:
         game_dir = resource_dir.resolve().parent
         if output_dir == game_dir or game_dir in output_dir.parents or output_dir in game_dir.parents:
@@ -178,7 +188,7 @@ def check_output_dir(output_dir: Path, resource_dir: Path | None = None) -> str 
     if output_dir.exists():
         if not output_dir.is_dir():
             return f"{output_dir} is not a folder"
-        if any(output_dir.iterdir()) and not (output_dir / "index.html").is_file():
+        if any(output_dir.iterdir()) and not is_previous_output(output_dir):
             return (
                 f"{output_dir} is not empty and does not contain a previous research tree. "
                 "Its contents would be deleted; choose an empty or new folder"
@@ -340,7 +350,7 @@ def run_gui(game_path: Path | None, output_dir: Path) -> int:
         if problem:
             messagebox.showerror("Output folder", problem, parent=root)
             return
-        if (target / "index.html").is_file() and not messagebox.askokcancel(
+        if is_previous_output(target) and not messagebox.askokcancel(
                 "Replace output", f"Replace the existing research tree in {target}?", parent=root):
             return
         build_button.configure(state="disabled")
@@ -375,7 +385,7 @@ def gui_available() -> bool:
     return True
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, default_output: Path | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Export the research trees from an installed copy of Call to Arms - Gates of Hell\n"
@@ -397,7 +407,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output", type=Path,
-        help=f"folder to replace with the generated website (default: {default_output_dir()})",
+        help=f"folder to replace with the generated website (default: {default_output})",
     )
     parser.add_argument("--no-gui", action="store_true",
                         help="do not open a window; use auto-detected or given folders")
@@ -405,10 +415,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    output_dir = args.output or default_output_dir()
+    default_output = default_output_dir()
+    args = parse_args(argv, default_output)
+    output_dir = args.output or default_output
     use_gui = not (args.no_gui or args.game_path or args.output)
-    detected = find_game_resource_dirs()
+    detected = [] if args.game_path else find_game_resource_dirs()
     if use_gui and gui_available():
         return run_gui(args.game_path or (detected[0].parent if detected else None), output_dir)
     if use_gui:
