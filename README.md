@@ -166,6 +166,38 @@ python3 -m pip install Pillow
 
 ## Quick start
 
+The easiest way is the combined launcher, which runs both stages below:
+
+```bash
+python3 build_research_tree.py
+```
+
+It opens a small window with the game and output folders, each with a
+**Browse…** button that uses the system folder picker (zenity or kdialog on
+Linux when installed). The game folder is detected automatically from Steam,
+including additional Steam libraries: the Windows registry and Program Files on
+Windows; native, Flatpak, and Snap Steam on Linux; and Steam, CrossOver, and
+Whisky bottles on macOS. The default output folder is
+`Gates of Hell Research Tree` in your Documents folder. Click **Build**, then
+**Open research tree**. The window uses Tkinter from the Python standard
+library; on some Linux distributions it is a separate package such as `python3-tk`.
+
+Passing a folder skips the window. Missing values use the detected game and the
+default output folder; `--no-gui` uses both defaults:
+
+```bash
+python3 build_research_tree.py --game-path "/path/to/Call to Arms - Gates of Hell" \
+  --output ~/goh-research-tree
+python3 build_research_tree.py --no-gui
+python3 build_research_tree.py --help
+```
+
+`--game-path` accepts the installation folder or its `resource` folder. The
+output folder is replaced, so the launcher only accepts a new or empty folder or
+a previous research-tree output. The intermediate export is stored temporarily.
+
+### Running the stages separately
+
 The scripts require the path to the game's `resource` directory. A typical Linux
 Steam installation uses:
 
@@ -273,6 +305,7 @@ deliberately excluded.
 ## Repository layout
 
 ```text
+build_research_tree.py         Detect the game and run both stages (GUI or CLI)
 export_research_trees.py       Extract game data and images
 create_research_tree_html.py   Enrich the export and build the viewer
 firepower.py                   Calculate firepower estimates and percentiles
