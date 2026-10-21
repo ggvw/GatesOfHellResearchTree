@@ -10,6 +10,7 @@ maintained database.
 ## Features
 
 - Navigable research graph for every detected faction
+- Graph/Table switch with a mobile-friendly unit list and shared filters
 - Automatic Steam Workshop discovery with a single-mod selector and separate base-game data
 - Localized in-game unit names and infantry levels
 - Unit portraits and icons extracted from the game archives
@@ -40,6 +41,20 @@ maintained database.
 
 
 ## Using the filters
+
+Choose Graph or Table in the top bar. Graph mode highlights matching nodes;
+Table mode lists matching units and removes rows that do not match. Search and
+branch selections also filter table rows. Table columns show unit name, CP, RP,
+total RP including shared prerequisites counted once, unit size, gun calibre,
+reload time, rate of fire, and movement speed. Select a unit name to open its
+statistics. Missing values appear as a dash. On small screens the table uses
+labelled rows, and filters can be opened with the side button. The viewer starts
+in Table mode on small screens and remembers an explicit view choice.
+
+In Table mode, gun calibre, reload time, RPM, and capacity filters use the
+largest-calibre weapon in the unit. Vehicles use mounted weapons only; infantry
+uses weapons carried by active squad members. Values come from the same weapon,
+so a cannon's calibre cannot be paired with a machine gun's rate of fire.
 
 The collapsible panel on the left highlights matching nodes. Most filters leave
 the complete research tree visible for context. The research-branch filter is
@@ -317,6 +332,7 @@ Run the viewer's armour filter checks with Node.js:
 
 ```bash
 node tests/test_armour_filters.js
+node tests/test_unit_table.js
 ```
 
 ## License

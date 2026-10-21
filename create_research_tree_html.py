@@ -1584,7 +1584,8 @@ html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background:
 button, select, input { color: inherit; background: #252b2e; border: 1px solid #596164; border-radius: 5px; padding: 7px 10px; }
 button { cursor: pointer; }
 button:hover { background: #343c40; }
-#toolbar { height: 54px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; }
+#toolbar { height: 54px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; overflow-x: auto; }
+#toolbar > * { flex-shrink: 0; }
 #search { width: min(260px, 24vw); }
 #hint { margin-left: auto; color: #9ca6a8; font-size: 12px; }
 #filter-panel { position: absolute; z-index: 12; left: 0; top: 54px; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
@@ -1616,6 +1617,20 @@ body.filters-collapsed #filter-toggle { left: 0; }
 body.stats-open #viewport { right: var(--stats-width, 560px); }
 body.filters-collapsed #viewport { left: 0; }
 #viewport.dragging { cursor: grabbing; }
+#table-view { position: absolute; inset: 54px 0 0 300px; overflow: auto; padding: 12px 18px 24px 38px; }
+#table-view[hidden], #viewport[hidden] { display: none; }
+body.filters-collapsed #table-view { left: 0; }
+body.stats-open #table-view { right: var(--stats-width, 560px); }
+body.table-mode .graph-control, body.table-mode #hint { display: none; }
+#unit-table { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
+#unit-table th, #unit-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; background: var(--panel); }
+#unit-table thead th { position: sticky; top: 0; z-index: 2; }
+#unit-table th:first-child { text-align: left; position: sticky; left: 0; z-index: 1; white-space: normal; min-width: 180px; }
+#unit-table thead th:first-child { z-index: 3; }
+#unit-table tr.selected > * { background: #344329; }
+#unit-table .unit-name { text-align: left; width: 100%; min-height: 40px; background: transparent; border-color: transparent; }
+#unit-table .unit-name:hover, #unit-table .unit-name:focus-visible { border-color: var(--accent); }
+#table-status { margin: 0 0 10px; }
 #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 #edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 .edge { stroke: var(--line); stroke-width: 3; fill: none; opacity: .7; }
@@ -1715,20 +1730,36 @@ html[data-theme="light"] .comparison thead th, html[data-theme="light"] .compari
 html[data-theme="light"] .comparison .comparison-section th { background: #dce3df; color: #754900; }
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
+html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
 @media (max-width: 1000px) { #hint { display: none; } }
 @media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } }
+@media (max-width: 760px) {
+  #table-view, body.stats-open #table-view { left: 0; right: 0; }
+  #unit-table thead { display: none; }
+  #unit-table, #unit-table tbody { display: block; }
+  #unit-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 6px; margin-bottom: 12px; overflow: hidden; }
+  #unit-table tr[hidden] { display: none; }
+  #unit-table td { display: flex; flex-direction: column; text-align: left; white-space: normal; min-width: 0; }
+  #unit-table td::before { content: attr(data-label); color: #9ea7a9; font-size: 12px; }
+  #unit-table th:first-child { grid-column: 1 / -1; position: static; min-width: 0; }
+  body.table-mode #details { width: 100%; }
+  body.table-mode #stats-resize { display: none; }
+  html[data-theme="light"] #unit-table td::before { color: #626e70; }
+}
 </style>
 </head>
 <body>
 <header id="toolbar">
+  <label for="view-mode">View</label>
+  <select id="view-mode" aria-label="View mode"><option value="graph">Graph</option><option value="table">Table</option></select>
   <label for="mod">Mod</label>
   <select id="mod" aria-label="Mod" style="max-width:260px" title="Steam Workshop mod"></select>
   <label for="faction">Faction</label>
   <select id="faction" aria-label="Faction"></select>
   <input id="search" type="search" placeholder="Find a unit…" aria-label="Find a unit">
-  <button id="zoom-out" title="Zoom out">−</button>
-  <button id="zoom-in" title="Zoom in">+</button>
-  <button id="fit">Fit tree</button>
+  <button id="zoom-out" class="graph-control" title="Zoom out">−</button>
+  <button id="zoom-in" class="graph-control" title="Zoom in">+</button>
+  <button id="fit" class="graph-control">Fit tree</button>
   <button id="clear">Clear highlighting</button>
   <button id="theme" aria-label="Toggle light and dark mode">☀ Light mode</button>
   <span id="hint">Drag to pan · wheel to zoom · click a node for details</span>
@@ -1800,6 +1831,15 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   <div id="filter-count"></div>
 </aside>
 <main id="viewport"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></main>
+<section id="table-view" aria-label="Unit table" hidden>
+  <p id="table-status" role="status"></p>
+  <p class="muted">Gun stats use the largest-calibre weapon. Select a unit for its statistics.</p>
+  <table id="unit-table"><thead><tr>
+    <th scope="col">Unit name</th><th scope="col">CP</th><th scope="col">RP</th>
+    <th scope="col">Total RP</th><th scope="col">Unit size</th><th scope="col">Gun calibre (mm)</th>
+    <th scope="col">Reload time (s)</th><th scope="col">Rate of fire (RPM)</th><th scope="col">Speed (km/h)</th>
+  </tr></thead><tbody id="unit-table-body"></tbody></table>
+</section>
 <aside id="details" aria-labelledby="stats-window-title" hidden>
   <div id="stats-resize" role="separator" aria-label="Resize statistics panel" aria-orientation="vertical" tabindex="0" aria-controls="details"></div>
   <header class="stats-window-header">
@@ -1814,6 +1854,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const trees = JSON.parse(document.getElementById('tree-data').textContent);
   const NODE_W = 150, NODE_H = 184, STEP_X = 184, STEP_Y = 202, PAD = 50;
   const viewport = document.getElementById('viewport');
+  const tableView = document.getElementById('table-view');
+  const viewModeInput = document.getElementById('view-mode');
+  const unitRows = new Map();
+  let viewMode = 'graph';
   const world = document.getElementById('world');
   const edgesLayer = document.getElementById('edges');
   const nodesLayer = document.getElementById('nodes');
@@ -2087,6 +2131,51 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   function originalNodePosition(node) { return { x: PAD + node.position.x * STEP_X, y: PAD + node.position.y * STEP_Y }; }
   function nodePosition(node) { return layoutPositions?.get(node.id) || originalNodePosition(node); }
 
+  function largestGun(node) {
+    const vehicle = node.unit?.vehicle || /^(?:vehicle|squad_vehicle)/.test(node.unit?.definition_type || '');
+    const weapons = node.vehicle_weapons?.length || vehicle ? node.vehicle_weapons || []
+      : (node.members || []).filter(member => member.count > 0).flatMap(member => member.weapons || []);
+    return weapons.reduce((largest, weapon) => {
+      if (!largest) return weapon;
+      return Number.isFinite(weapon.caliber_mm) && (!Number.isFinite(largest.caliber_mm) || weapon.caliber_mm > largest.caliber_mm) ? weapon : largest;
+    }, null);
+  }
+
+  function totalResearchPoints(node, required = prerequisiteSet(node.id)) {
+    return [node, ...[...required].filter(id => id !== node.id).map(id => byId.get(id)).filter(Boolean)]
+      .reduce((sum, item) => sum + Number(item.cost || 0), 0);
+  }
+
+  function renderUnitTable() {
+    const body = document.getElementById('unit-table-body');
+    body.replaceChildren();
+    unitRows.clear();
+    const columns = ['CP', 'RP', 'Total RP', 'Unit size', 'Gun calibre (mm)', 'Reload time (s)', 'Rate of fire (RPM)', 'Speed (km/h)'];
+    for (const node of tree.nodes.filter(node => node.unit)) {
+      const gun = largestGun(node);
+      const values = [node.stats?.command_points ?? node.unit.cp, node.cost, totalResearchPoints(node),
+        node.stats?.unit_count, gun?.caliber_mm, gun?.reload_time_seconds, gun?.rate_of_fire_rpm, node.unit_speed_kmh];
+      const row = document.createElement('tr');
+      row.dataset.nodeId = node.id;
+      row.innerHTML = `<th scope="row"><button type="button" class="unit-name">${esc(node.display_name)}</button></th>`
+        + values.map((value, index) => `<td data-label="${esc(columns[index])}">${Number.isFinite(value) ? esc(number(value)) : '—'}</td>`).join('');
+      row.querySelector('button').addEventListener('click', () => selectNode(node.id));
+      body.append(row);
+      unitRows.set(node.id, row);
+    }
+  }
+
+  function setViewMode(mode) {
+    viewMode = mode === 'table' ? 'table' : 'graph';
+    viewModeInput.value = viewMode;
+    document.body.classList.toggle('table-mode', viewMode === 'table');
+    tableView.hidden = viewMode !== 'table';
+    viewport.hidden = viewMode === 'table';
+    try { localStorage.setItem('research-tree-view', viewMode); } catch (_) {}
+    applyFilters();
+    if (viewMode === 'graph' && tree) requestAnimationFrame(fitTree);
+  }
+
   function renderTree(faction) {
     tree = trees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
     updateInfantryWeaponOptions();
@@ -2142,6 +2231,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       card.addEventListener('click', event => { event.stopPropagation(); selectNode(node.id); });
       nodesLayer.append(card); nodeElements.set(node.id, card);
     }
+    renderUnitTable();
     clearHighlighting();
     applyFilters();
     requestAnimationFrame(startView);
@@ -2231,16 +2321,18 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const minTurretTurnSpeed = Number(minTurretTurnSpeedInput.value);
     const maxCp = Number(maxCpInput.value);
     const matchingIds = new Set();
+    const query = document.getElementById('search').value.trim().toLowerCase();
     for (const [id, element] of nodeElements) {
       const node = byId.get(id);
       const unitSize = node.stats?.unit_count;
       const unitLevel = node.unit_level;
       const infantryAt = node.anti_tank_weapon_count;
       const unitSpeed = node.unit_speed_kmh;
-      const primaryRounds = node.primary_rounds_before_reload;
-      const primaryRate = node.primary_rate_of_fire_rpm;
-      const caliber = node.main_gun_caliber_mm;
-      const reload = node.reload_time;
+      const gun = viewMode === 'table' ? largestGun(node) : null;
+      const primaryRounds = viewMode === 'table' ? gun?.rounds_before_reload : node.primary_rounds_before_reload;
+      const primaryRate = viewMode === 'table' ? gun?.rate_of_fire_rpm : node.primary_rate_of_fire_rpm;
+      const caliber = viewMode === 'table' ? gun?.caliber_mm : node.main_gun_caliber_mm;
+      const reload = viewMode === 'table' ? gun?.reload_time_seconds : node.reload_time;
       const commandPoints = node.unit?.cp;
       const match = active
         && (!hasMinSize || (unitSize !== null && unitSize !== undefined && unitSize >= minSize))
@@ -2265,6 +2357,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!selectedInfantryWeapons.size || (node.infantry_weapons || []).some(weapon => selectedInfantryWeapons.has(weapon)))
         && (!selectedSpecialists.size || (node.specialist_types || []).some(type => selectedSpecialists.has(type)));
       element.classList.toggle('filter-match', match);
+      element.classList.toggle('search-match', !!query && (id.toLowerCase().includes(query) || node.display_name.toLowerCase().includes(query)));
       if (match) matchingIds.add(id);
     }
     const selectedBranches = selectedBranchTypes();
@@ -2284,6 +2377,16 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       updateGraphLayout();
       filterCount.textContent = active ? `${matchingIds.size} matching nodes` : '';
     }
+    let visibleRows = 0;
+    for (const [id, row] of unitRows) {
+      const node = byId.get(id);
+      const branchMatch = !selectedBranches.size || (node.branch_types || []).some(branch => selectedBranches.has(branch));
+      const searchMatch = !query || id.toLowerCase().includes(query) || node.display_name.toLowerCase().includes(query);
+      row.hidden = !(branchMatch && searchMatch && (!active || matchingIds.has(id)));
+      if (!row.hidden) visibleRows++;
+    }
+    document.getElementById('table-status').textContent = `${visibleRows} of ${unitRows.size} units` + (visibleRows ? '' : ' · No units match the current filters.');
+    if (viewMode === 'table') filterCount.textContent = `${visibleRows} matching units`;
   }
 
   function prerequisiteSet(nodeId) {
@@ -2302,6 +2405,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 
   function selectNode(nodeId) {
     selectedNodeId = nodeId;
+    for (const [id, row] of unitRows) row.classList.toggle('selected', id === nodeId);
     const node = byId.get(nodeId), required = prerequisiteSet(nodeId);
     const active = new Set(required); active.add(nodeId);
     for (const [id, element] of nodeElements) {
@@ -2323,6 +2427,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 
   function clearHighlighting() {
     selectedNodeId = null;
+    for (const row of unitRows.values()) row.classList.remove('selected');
     for (const element of nodeElements?.values() || []) element.classList.remove('selected', 'required', 'dimmed');
     for (const edge of edgeElements || []) edge.element.classList.remove('highlight', 'dimmed');
     closeStatsPanel();
@@ -2467,7 +2572,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   function renderDetails(node, required) {
     saveSectionStates(detailContent, 'stats');
     const allNodes = [node, ...[...required].map(id => byId.get(id)).filter(Boolean)];
-    const totalCost = allNodes.reduce((sum, item) => sum + Number(item.cost || 0), 0);
+    const totalCost = totalResearchPoints(node, required);
     const missing = new Set();
     for (const item of allNodes) for (const id of item.requires) if (!byId.has(id)) missing.add(id);
     const image = node.web_image ? `<img src="${esc(node.web_image)}" alt="">` : '';
@@ -2502,6 +2607,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function fitTree() {
+    if (viewMode === 'table') return;
     const availableWidth = viewport.clientWidth;
     const availableHeight = viewport.clientHeight;
     scale = Math.min(.8, availableWidth / worldWidth, availableHeight / worldHeight);
@@ -2512,6 +2618,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function startView() {
+    if (viewMode === 'table') return;
     scale = Math.max(.18, Math.min(.65, viewport.clientWidth * .92 / worldWidth));
     tx = (viewport.clientWidth - worldWidth * scale) / 2;
     ty = 20;
@@ -2525,6 +2632,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
 
   function keepSelectedNodeVisible() {
+    if (viewMode === 'table') return;
     if (!selectedNodeId || nodeElements.get(selectedNodeId)?.style.display === 'none') return;
     const node = byId.get(selectedNodeId);
     if (!node) return;
@@ -2646,18 +2754,17 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
     updateFilterSummaries(); applyFilters(); fitTree();
   });
-  document.getElementById('search').addEventListener('input', event => {
-    const query = event.target.value.trim().toLowerCase();
-    for (const [id, element] of nodeElements) {
-      const node = byId.get(id);
-      element.classList.toggle('search-match', !!query && (id.toLowerCase().includes(query) || node.display_name.toLowerCase().includes(query)));
-    }
-  });
+  document.getElementById('search').addEventListener('input', applyFilters);
+  viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
   window.addEventListener('resize', () => {
     if (details.hidden) fitTree();
     else resizeStatsPanel(statsWidth);
   });
+  let initialView = matchMedia('(max-width: 760px)').matches ? 'table' : 'graph';
+  try { initialView = localStorage.getItem('research-tree-view') || initialView; } catch (_) {}
+  setViewMode(initialView);
   renderTree(factionSelect.value);
+  if (matchMedia('(max-width: 760px)').matches) document.getElementById('filter-toggle').click();
 })();
 </script>
 </body>
