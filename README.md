@@ -16,7 +16,7 @@ maintained database.
 - Prerequisite highlighting and total research-point calculation
 - Light and dark themes
 - A collapsible filter panel with squad size, level, command-point, reload-time,
-  unit-speed, armor, gun-caliber, indirect-fire, and infantry-equipment
+  unit-speed, armour, gun-caliber, indirect-fire, and infantry-equipment
   filters
 - Multiselect filters for infantry inventory, individual weapons, weapon roles,
   and specialist types
@@ -27,9 +27,10 @@ maintained database.
   vehicle statistics in a separate table and quantities shown for each variant
 - Localized main, secondary, and additional carried weapons for each soldier
 - Localized vehicle guns and machine guns, with calibre and reload statistics
+- Turret turn speeds in degrees per second, with a minimum-speed filter
 - Per-gun ammunition types and counts, including spare and loaded rounds
 - Rounds before reload for infantry and vehicle weapons, with a primary-weapon
-  minimum-capacity filter in General
+  minimum-capacity filter in Weapons
 - Weapon rate of fire in RPM, with a primary-weapon minimum-rate filter
 - Firepower metrics with filters, role-group percentiles, and target-specific help
 - A self-contained `index.html` that works without a web server
@@ -48,7 +49,11 @@ Selecting several values within one multiselect matches units containing any of
 those values. Selections from different filter groups are combined, so a unit
 must satisfy every active group.
 
-The General section's Unit speed (km/h) filter sets a minimum movement speed.
+Filters are grouped into General (CP, size, speed), Infantry (level and equipment),
+Weapons (calibre, capacity, rate, reload, turret turn speed, indirect fire), Armour, and Firepower
+estimates.
+
+The General section's Min speed (km/h) filter sets a minimum movement speed.
 Infantry uses the game's base sprint speed with breed perk modifiers; squads
 use their slowest member. Mounted units use their vehicle's road speed. Each
 soldier's sprint speed is also shown in the comparison table. These are configured
@@ -60,10 +65,26 @@ weapon in an infantry squad. Secondary and additional weapons do not affect
 matching. This is weapon capacity, separate from starting loaded rounds and
 total ammunition carried. Unknown capacities do not match the filter.
 
+Armour filters set minimum thicknesses for front, left side, right side, rear,
+roof, floor, and default thickness. Choose hull, turret, hull and turret, or any
+part (including mantlets and shields). A single part must satisfy every entered
+minimum; values from different plates are never combined. Hull includes engine
+compartment parts. A face without an override uses that part's default thickness.
+Unknown thicknesses do not match, and an explicit zero remains zero. Changing
+the part selector alone does not activate a filter. Clear filters also resets
+the part selection.
+
 Min rate of fire (RPM) uses the same primary-weapon rule. Rates come from weapon
 definitions and their inherited presets. For single-shot weapons without an
 explicit rate, RPM is calculated as 60 divided by reload time in seconds.
 AI burst pauses, aiming, and other delays can reduce actual firing rates.
+
+Min turret turn speed (°/s) checks the main turret's configured turn speed.
+The Vehicle stats table shows it when available, with other turret speeds listed
+separately. Values come from turret bone settings, including arithmetic in
+parameterized presets; a preset's `power_traverse` argument is not itself the
+final turn speed. Gun elevation, hull traverse, and commander optics are excluded.
+Missing or unsupported values do not match the filter. Mod overrides are respected.
 
 Indirect fire includes mortar and artillery entity settings, the PIAT carried by
 infantry, the Sturmmörser’s RW61 rocket mortar, and mounted weapons with curved-fire
@@ -76,7 +97,7 @@ share generic RPG/rocket patterns without a distinct indirect-fire flag.
 
 ### Firepower
 
-The stats panel and filter panel include help explaining each estimate and its
+The Firepower estimates filter section includes help explaining each estimate and its
 limitations. Hover over metric labels for a short explanation.
 
 | Metric | Meaning | Useful for |
@@ -243,7 +264,7 @@ The process is intentionally split into two stages:
 1. `export_research_trees.py` reads research, roster, breed, and interface
    archives. It writes one JSON file per faction plus the corresponding images.
 2. `create_research_tree_html.py` enriches that export with localization,
-   vehicle armor and road speed, weapon, reload, indirect-fire, and equipment
+   vehicle armour and road speed, weapon, reload, indirect-fire, and equipment
    data. It converts images to PNG and embeds all faction data in one HTML file.
 
 The generated directories are ignored by Git because they contain extracted game
@@ -290,6 +311,12 @@ Run the calculation, Workshop overlay, and extraction tests with:
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+Run the viewer's armour filter checks with Node.js:
+
+```bash
+node tests/test_armour_filters.js
 ```
 
 ## License

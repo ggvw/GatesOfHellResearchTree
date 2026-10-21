@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import posixpath
 import re
 import shutil
@@ -526,6 +527,106 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
                     node["unit_speed_basis"] = "Sprint speed (slowest member)"
 
 
+def sdl_number(expression: str) -> float | None:
+    """Evaluate numeric SDL arithmetic without executing game code."""
+    tokens = iter(re.findall(r'\(|\)|[^\s()]+', expression))
+
+    def read(token):
+        if token != '(':
+            return float(token)
+        operation = next(tokens)
+        values = []
+        while (token := next(tokens)) != ')':
+            values.append(read(token))
+        if not values:
+            raise ValueError('Empty arithmetic expression')
+        if operation == '+':
+            return sum(values)
+        if operation == '*':
+            return math.prod(values)
+        if operation == '-':
+            return values[0] - sum(values[1:]) if len(values) > 1 else -values[0]
+        if operation == '/':
+            value = values[0]
+            for divisor in values[1:]:
+                value /= divisor
+            return value
+        raise ValueError('Unsupported arithmetic operator')
+
+    try:
+        value = read(next(tokens))
+        if next(tokens, None) is not None or not math.isfinite(value):
+            return None
+        return value
+    except (ValueError, StopIteration, ZeroDivisionError, OverflowError, RecursionError):
+        return None
+
+
+def turret_turn_speeds(definition_text: str) -> list[dict]:
+    """Resolve turret bone speed2 values, including parameterized presets."""
+    text = re.sub(r';[^\r\n]*', '', definition_text)
+    templates = _named_parenthesized_blocks(text, '(define ')
+    invocation = re.compile(r'\(\s*"([^"\n]+)"((?:\s+\w+\([^()]*\))*)\s*\)')
+
+    def expand(text, active=frozenset()):
+        def replace(match):
+            name = match[1]
+            if name not in templates or name in active or len(active) >= 64:
+                return match[0]
+            arguments = dict(re.findall(r'(\w+)\(([^()]*)\)', match[2]))
+            body = re.sub(r'^\(define\s+"[^"]+"', '', templates[name])[:-1]
+            body = re.sub(r'%(\w+)', lambda item: arguments.get(item[1], item[0]), body)
+            return expand(body, active | {name})
+        return invocation.sub(replace, text)
+
+    speeds = {}
+    active_text = active_definition_text(text)
+    for match in re.finditer(r'\{bone\s+"((?:aux_)?turret[^"\s]*)"', active_text, re.I):
+        # Work with the active text so uninvoked shared presets cannot add turrets.
+        block = expand(brace_section(active_text[match.start():], 'bone'))
+        values = list(re.finditer(r'\{speed2\s+([^{}]+)\}', block, re.I))
+        if values:
+            value = sdl_number(values[-1][1])
+            speeds[match[1]] = value if value is not None and value >= 0 else None
+        else:
+            speeds.setdefault(match[1], None)
+    return [{'turret': name, 'degrees_per_second': value} for name, value in
+            sorted(speeds.items(), key=lambda item: (item[0] != 'turret', item[0].startswith('aux_'), item[0]))]
+
+
+def vehicle_armor(definition_text: str) -> list[dict]:
+    """Read explicit part thicknesses and the game's armor-setting shortcuts."""
+    text = active_definition_text(definition_text)
+    number = r'([0-9]+(?:\.[0-9]+)?)'
+    parts = {}
+    settings = []
+    for match in re.finditer(r'\{volume\s+"([^"]+)"', text, re.IGNORECASE):
+        block = brace_section(text[match.start():], 'volume')
+        thickness = brace_section(block, 'thickness')
+        if not thickness:
+            continue
+        values = {}
+        if default := re.match(r'\{thickness\s+' + number + r'(?=\s|\})', thickness, re.I):
+            values['default_mm'] = float(default[1])
+        for face, value in re.findall(r'\{([a-z_]+)\s+' + number + r'\s*\}', thickness[1:], re.I):
+            values[face.lower() + '_mm'] = float(value)
+        if values:
+            if cast := re.search(r'\{CastSteel\s+' + number + r'\s*\}', block, re.I):
+                values['cast_steel_coefficient'] = float(cast[1])
+            settings.append((match.start(), match[1], values))
+    # These macros set thickness without a literal volume block in the .ext.
+    for match in re.finditer(
+        r'\("(?:shield(?:_group|_part|_track|_tear)?|gun_shield|armor)"\s+args\s+"([^"]+)"\s+'
+        + number + r'\s*\)', text, re.I,
+    ):
+        settings.append((match.start(), match[1], {'default_mm': float(match[2])}))
+    for match in re.finditer(r'\("(tracks|gun\d*|barrel\d*)"([^\n]*?)\bthickness\(' + number + r'\)', text, re.I):
+        settings.append((match.start(), match[1], {'default_mm': float(match[3])}))
+    for _, name, values in sorted(settings):
+        parts.setdefault(name, {}).update(values)
+    return [{'part': name, **values} for name, values in parts.items()]
+
+
 def armor_thickness(definition_text: str) -> tuple[float | None, float | None]:
     """Return the best front-armor estimate and maximum armor value."""
     front = [
@@ -767,8 +868,8 @@ def annotate_infantry_capabilities(
     )
 
 
-def has_indirect_fire(definition_text: str) -> bool:
-    """Check active entity settings, excluding comments and unused templates."""
+def active_definition_text(definition_text: str) -> str:
+    """Remove comments and uninvoked template declarations from entity settings."""
     text = re.sub(r';[^\r\n]*', '', definition_text)
     # Shared cannon properties declare templates for many weapon types. A
     # declaration is not an invocation: only the unit's active text is evidence.
@@ -785,6 +886,12 @@ def has_indirect_fire(definition_text: str) -> bool:
                     end = match.start() + token.end()
                     break
         text = text[:match.start()] + text[end:]
+    return text
+
+
+def has_indirect_fire(definition_text: str) -> bool:
+    """Check active entity settings, excluding comments and unused templates."""
+    text = active_definition_text(definition_text)
     return bool(re.search(
         r'"(?:artillery|indirect)_minimap(?:_[^"\r\n]+)?"|\(\s*"abm_dymamic_mortar"(?:\s|\))|\{props[^}]*"mortar"',
         text, re.IGNORECASE,
@@ -1094,6 +1201,7 @@ def annotate_unit_metadata(
                 for member in node.get("members") or []:
                     annotate_member_weapons(member, handheld_weapon_categories)
                     for weapon in member["weapons"]:
+                        weapon["indirect_fire"] = weapon_indirect_fire(weapon["id"])
                         weapon["rounds_before_reload"] = weapon_filling(weapon["id"])[1]
                         weapon["rate_of_fire_rpm"] = weapon_fire_rate(weapon["id"])
                         weapon["reload_time_seconds"], weapon["caliber_mm"] = weapon_metadata(weapon["id"])
@@ -1161,6 +1269,7 @@ def annotate_unit_metadata(
                     name = re.sub(r"<c\([^)]*\)>(.*?)</c>", r"\1", name)
                     node["vehicle_weapons"].append({
                         "id": reference, "display_name": name,
+                        "indirect_fire": weapon_indirect_fire(reference),
                         "mount_count": weapon_mount_counts[reference],
                         "caliber_mm": caliber, "reload_time_seconds": reload_time,
                         "rounds_before_reload": weapon_filling(reference)[1],
@@ -1185,6 +1294,11 @@ def annotate_unit_metadata(
                     caliber_count += 1
 
                 node["vehicle_speed_kmh"] = vehicle_speed(definition_text)
+                node["turret_turn_speeds"] = turret_turn_speeds(definition_text)
+                node["turret_turn_speed_deg_s"] = (
+                    node["turret_turn_speeds"][0]["degrees_per_second"]
+                    if node["turret_turn_speeds"] else None
+                )
                 if node["vehicle_speed_kmh"] is not None:
                     speed_count += 1
 
@@ -1192,6 +1306,7 @@ def annotate_unit_metadata(
                     node["front_armor_thickness_mm"],
                     node["maximum_armor_thickness_mm"],
                 ) = armor_thickness(definition_text)
+                node["armor_parts"] = vehicle_armor(definition_text)
                 if node["front_armor_thickness_mm"] is not None:
                     armor_count += 1
 
@@ -1377,7 +1492,7 @@ def enrich_trees(trees: list[dict], game_files: GameFiles) -> None:
         "from entity and weapon definitions"
     )
     log(f"Resolved primary-weapon reload time for {reload_count} research nodes")
-    log(f"Resolved frontal armor thickness for {armor_count} research nodes")
+    log(f"Resolved frontal armour thickness for {armor_count} research nodes")
     log(f"Resolved main-gun caliber for {caliber_count} research nodes")
     log(f"Resolved vehicle road speed for {speed_count} research nodes")
     annotate_unit_speeds(trees, game_files)
@@ -1481,7 +1596,8 @@ body.filters-collapsed #filter-toggle { left: 0; }
 .filter-group > summary { color: #e0ad4f; font-weight: 700; cursor: pointer; }
 .filter-group[open] > summary { margin-bottom: 10px; }
 .filter-group > label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; color: #b8c0c2; }
-.firepower-controls label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; color: #b8c0c2; }
+.firepower-controls label, #armour-controls label { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 7px 0; color: #b8c0c2; }
+#armour-part { max-width: 165px; }
 .metric-help { font-size: 12px; line-height: 1.5; }
 .metric-help h4 { margin: 12px 0 4px; }
 .metric-help p { margin: 5px 0 9px; }
@@ -1547,7 +1663,7 @@ body.resizing-stats { cursor: col-resize; user-select: none; }
 .detail-head img { width: 112px; height: 140px; object-fit: cover; border: 1px solid #626a6c; border-radius: 5px; }
 .detail-head h2 { margin: 0 0 5px; font-size: 21px; }
 .muted { color: #9ea7a9; overflow-wrap: anywhere; }
-.totals { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; margin: 12px 0; }
+.totals { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin: 12px 0; }
 .total { padding: 8px; background: #252b2e; border-radius: 5px; text-align: center; }
 .total strong { display: block; font-size: 18px; color: #f0c873; }
 .stat-section { margin-top: 18px; }
@@ -1629,10 +1745,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     <summary>General</summary>
     <label>Max command points (CP) <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
-    <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
-    <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
-    <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Unit speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
-    <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
+    <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Min speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
   </details>
   <details class="filter-group" id="infantry-filter">
     <summary>Infantry</summary>
@@ -1655,14 +1768,28 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <div class="multi-options" id="specialist-options" role="group" aria-label="Specialist types"></div>
     </details>
   </details>
-  <details class="filter-group" id="vehicles-filter">
-    <summary>Vehicles and guns</summary>
-    <label>Min front armour (mm) <input id="min-front-armor" type="number" min="0" step="0.1" placeholder="Any"></label>
+  <details class="filter-group" id="weapons-filter">
+    <summary>Weapons</summary>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
+    <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
+    <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
+    <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
+    <label title="Minimum configured turn speed of the main turret; unknown speeds do not match">Min turret turn speed (°/s) <input id="min-turret-turn-speed" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
   </details>
+  <details class="filter-group" id="armour-filter">
+    <summary>Armour</summary>
+    <label>Part <select id="armour-part" aria-label="Armour part">
+      <option value="main">Hull and turret</option>
+      <option value="hull">Hull</option>
+      <option value="turret">Turret</option>
+      <option value="any">Any part</option>
+    </select></label>
+    <div id="armour-controls"></div>
+    <p class="muted metric-help">Thickness in mm. A single part must meet every minimum. Faces without an override use that part’s default. Unknown values do not match.</p>
+  </details>
   <details class="filter-group" id="firepower-filter">
-    <summary>Firepower</summary>
+    <summary>Firepower estimates</summary>
     <div class="firepower-controls" id="firepower-controls"></div>
     <details class="metric-help" id="firepower-filter-help">
       <summary>Metric help and target types</summary>
@@ -1703,9 +1830,20 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   const minUnitSpeedInput = document.getElementById('min-unit-speed');
   const minRoundsInput = document.getElementById('min-rounds-before-reload');
   const minRateInput = document.getElementById('min-rate-of-fire');
-  const minFrontArmorInput = document.getElementById('min-front-armor');
+  const armourPartInput = document.getElementById('armour-part');
+  const armourControls = new Map();
+  for (const [face, name] of [
+    ['front', 'front'], ['left', 'left side'], ['right', 'right side'],
+    ['rear', 'rear'], ['top', 'roof'], ['bottom', 'floor'], ['default', 'default'],
+  ]) {
+    const control = document.createElement('label');
+    control.innerHTML = `Min ${name} (mm) <input id="min-${face}-armor" type="number" min="0" step="0.1" placeholder="Any">`;
+    document.getElementById('armour-controls').append(control);
+    armourControls.set(face, control.querySelector('input'));
+  }
   const minCaliberInput = document.getElementById('min-caliber');
   const maxReloadInput = document.getElementById('max-reload');
+  const minTurretTurnSpeedInput = document.getElementById('min-turret-turn-speed');
   const maxCpInput = document.getElementById('max-cp');
   const hasIndirectFireInput = document.getElementById('has-indirect-fire');
   const inventoryOptions = document.getElementById('inventory-options');
@@ -1723,7 +1861,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   let scale = 1, tx = 0, ty = 0, dragging = false, dragStart, panMoved = false;
 
   const esc = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const label = key => key.replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+  const label = key => key === 'turret_turn_speed_deg_s' ? 'Turret turn speed (°/s)' : key.replace(/armor/gi, 'armour').replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   const shown = value => value !== null && value !== undefined && value !== '' && (!Array.isArray(value) || value.length);
   const number = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
 
@@ -1753,7 +1891,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       <p>Primary and secondary output are always separate. Vehicles use the main gun and the next mounted gun type respectively; identical mounts of a type retain their quantity. Crew personal weapons are excluded. Infantry sums soldiers’ first weapons as primary and their second weapons as secondary, using soldier quantities. Additional weapons are listed separately by type; thrown grenades are excluded. Infantry primary and secondary estimates are alternatives, not simultaneous fire. Each slot’s CP efficiency uses the full unit CP.</p>
       <p>All weapons start fully loaded with unlimited resupply for the sustained estimate. AI burst pauses, aiming, accuracy, recoil, distance, stamina, armour, explosives, and survivability are not modelled. If any included weapon lacks required data, the affected unit metric is Unknown; unknown values do not match filters.</p>
       <p>Percentiles compare the same weapon slot within the same faction and role group: primary with primary, secondary with secondary. Additional weapons have no percentile. Ties share a rank; a single-unit group receives 50. A percentile is a relative ranking, not a damage percentage or a chance to win.</p>
-      <p>Primary and secondary filters apply independently to their slot’s raw estimates; their outputs are never added together. Multiple active filters must all match. A missing weapon does not match numeric filters. Individual RPM and rounds-before-reload filters in General still apply only to primary weapons.</p>
+      <p>Primary and secondary filters apply independently to their slot’s raw estimates; their outputs are never added together. Multiple active filters must all match. A missing weapon does not match numeric filters. Individual RPM and rounds-before-reload filters in Weapons still apply only to primary weapons.</p>
     </div>`;
   const firepowerControls = new Map();
   for (const slot of ['primary', 'secondary']) {
@@ -2049,6 +2187,19 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     edgesLayer.setAttribute('viewBox', `0 0 ${worldWidth} ${worldHeight}`);
   }
 
+  function matchesArmour(node, scope, minimums) {
+    if (!minimums.length) return true;
+    return (node.armor_parts || []).some(part => {
+      const hull = /^(?:body|hull|engine)(?:\d|_|$)/i.test(part.part);
+      const turret = /^(?:turret|aux_turret)(?:\d|_|$)/i.test(part.part);
+      if (scope === 'hull' && !hull || scope === 'turret' && !turret || scope === 'main' && !hull && !turret) return false;
+      return minimums.every(([face, minimum]) => {
+        const value = part[`${face}_mm`] ?? part.default_mm;
+        return Number.isFinite(value) && value >= minimum;
+      });
+    });
+  }
+
   function applyFilters() {
     if (!tree || !nodeElements) return;
     const hasMinSize = minSizeInput.value !== '';
@@ -2057,9 +2208,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const hasMinUnitSpeed = minUnitSpeedInput.value !== '';
     const hasMinRounds = minRoundsInput.value !== '';
     const hasMinRate = minRateInput.value !== '';
-    const hasMinFrontArmor = minFrontArmorInput.value !== '';
+    const armourFilters = [...armourControls].filter(([, input]) => input.value !== '').map(([face, input]) => [face, Number(input.value)]);
     const hasMinCaliber = minCaliberInput.value !== '';
     const hasMaxReload = maxReloadInput.value !== '';
+    const hasMinTurretTurnSpeed = minTurretTurnSpeedInput.value !== '';
     const hasMaxCp = maxCpInput.value !== '';
     const firepowerFilters = [...firepowerControls].filter(([, input]) => input.value !== '');
     const indirectFireOnly = hasIndirectFireInput.checked;
@@ -2067,16 +2219,16 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || hasMinFrontArmor || hasMinCaliber || hasMaxReload || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length;
+    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
     const minUnitSpeed = Number(minUnitSpeedInput.value);
     const minRounds = Number(minRoundsInput.value);
     const minRate = Number(minRateInput.value);
-    const minFrontArmor = Number(minFrontArmorInput.value);
     const minCaliber = Number(minCaliberInput.value);
     const maxReload = Number(maxReloadInput.value);
+    const minTurretTurnSpeed = Number(minTurretTurnSpeedInput.value);
     const maxCp = Number(maxCpInput.value);
     const matchingIds = new Set();
     for (const [id, element] of nodeElements) {
@@ -2087,7 +2239,6 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       const unitSpeed = node.unit_speed_kmh;
       const primaryRounds = node.primary_rounds_before_reload;
       const primaryRate = node.primary_rate_of_fire_rpm;
-      const frontArmor = node.front_armor_thickness_mm;
       const caliber = node.main_gun_caliber_mm;
       const reload = node.reload_time;
       const commandPoints = node.unit?.cp;
@@ -2098,9 +2249,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         && (!hasMinUnitSpeed || (unitSpeed !== null && unitSpeed !== undefined && unitSpeed >= minUnitSpeed))
         && (!hasMinRounds || (primaryRounds !== null && primaryRounds !== undefined && primaryRounds >= minRounds))
         && (!hasMinRate || (primaryRate !== null && primaryRate !== undefined && primaryRate >= minRate))
-        && (!hasMinFrontArmor || (frontArmor !== null && frontArmor !== undefined && frontArmor >= minFrontArmor))
+        && matchesArmour(node, armourPartInput.value, armourFilters)
         && (!hasMinCaliber || (caliber !== null && caliber !== undefined && caliber >= minCaliber))
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
+        && (!hasMinTurretTurnSpeed || (Number.isFinite(node.turret_turn_speed_deg_s) && node.turret_turn_speed_deg_s >= minTurretTurnSpeed))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
         && firepowerFilters.every(([key, input]) => {
           const [slot, metric] = key.split('.');
@@ -2183,7 +2335,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
 
   const hiddenStatFields = new Set([
     'id', 'definition_type', 'cp_source', 'position_x', 'position_y',
-    'source_asset', 'portrait_id', 'icon_id', 'path', 'skin'
+    'source_asset', 'portrait_id', 'icon_id', 'path', 'skin', 'command_points'
   ]);
 
   function statRows(object, omitted = new Set()) {
@@ -2199,7 +2351,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     return esc(value);
   }
 
-  function comparisonTable(columns, sections) {
+  function comparisonTable(columns, sections, description = 'Unit comparison') {
     const rows = sections.map(section => {
       const keys = [...new Set(section.values.flatMap(value => Object.keys(value || {})))];
       const visibleKeys = keys.filter(key => !hiddenStatFields.has(key)
@@ -2210,7 +2362,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
         `<td>${shown(value?.[key]) ? formatValue(value[key]) : '—'}</td>`
       ).join('')}</tr>`).join('');
     }).join('');
-    return `<div class="comparison-scroll" tabindex="0" role="region" aria-label="Unit comparison"><table class="comparison"><thead><tr><th scope="col">Statistic</th>${columns.map(name => `<th scope="col">${esc(name)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`;
+    return `<div class="comparison-scroll" tabindex="0" role="region" aria-label="${esc(description)}"><table class="comparison"><thead><tr><th scope="col">Statistic</th>${columns.map(name => `<th scope="col">${esc(name)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`;
   }
 
   function inventoryRows(member) {
@@ -2231,26 +2383,6 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     return `<details class="stat-section" data-state-key="${esc(key)}"${expanded ? ' open' : ''}><summary>${esc(title)}</summary>${content}</details>`;
   }
 
-  function firepowerStats(node) {
-    const firepower = node.firepower || {};
-    function weaponTable(title, metrics = {}) {
-      if (!metrics.weapon_count) return statSection(title, '<p class="muted">No weapon listed.</p>');
-      const weapons = (metrics.weapons || []).map(weapon => `${esc(weapon.count)} × ${esc(weapon.name)}`).join(', ');
-      const rows = firepowerDefinitions.map(metric => {
-        const value = metrics[metric.key];
-        const percentile = metrics.percentiles?.[metric.key];
-        return `<tr><th scope="row" title="${esc(metric.help)}">${esc(metric.label)}</th><td>${shown(value) ? `${esc(number(value))} ${esc(metric.unit)}` : 'Unknown'}</td><td>${shown(percentile) ? `${esc(number(percentile))} / 100` : '—'}</td></tr>`;
-      }).join('');
-      return statSection(title, `<p class="muted">${weapons}</p><div class="comparison-scroll" tabindex="0" role="region" aria-label="${esc(title)} metrics"><table class="comparison"><thead><tr><th scope="col">Metric</th><th scope="col">Estimate</th><th scope="col">Slot percentile</th></tr></thead><tbody>${rows}</tbody></table></div>`);
-    }
-    const content = `<p class="muted">Theoretical fire volume, not damage. Comparison group: ${esc(tree.faction.toUpperCase())} · ${esc(firepower.group || 'Unknown')}. Primary and secondary output are not combined.</p>
-      ${weaponTable('Primary firepower', firepower.primary)}
-      ${weaponTable('Secondary firepower', firepower.secondary)}
-      ${(firepower.other || []).map((metrics, index) => weaponTable(`Additional weapon ${index + 1} firepower`, metrics)).join('')}
-      ${statSection('Firepower help and target types', firepowerHelp, false)}`;
-    return statSection('Firepower', content);
-  }
-
   function memberTables(node) {
     const groups = new Map();
     for (const member of node.members || []) {
@@ -2261,16 +2393,6 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     }
     return [...groups].map(([group, members]) => {
       const sections = [
-        {title: 'Weapons (per soldier)', values: members.map(member => {
-          const rows = {};
-          for (const [index, weapon] of (member.weapons || []).entries()) {
-            const prefix = index === 0 ? 'main_weapon' : index === 1 ? 'secondary_weapon' : `other_weapon_${index - 1}`;
-            rows[prefix] = weapon.display_name;
-            rows[`${prefix}_rounds_before_reload`] = weapon.rounds_before_reload ?? 'Unknown';
-            rows[`${prefix}_rate_of_fire_rpm`] = weapon.rate_of_fire_rpm ?? 'Unknown';
-          }
-          return rows;
-        })},
         {title: 'Inventory (per soldier)', values: members.map(inventoryRows)},
         {title: 'Composition', values: members.map(member => ({
           amount_of_units: member.count, slot: member.slot,
@@ -2294,21 +2416,52 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     }).join('');
   }
 
-  function vehicleWeaponRows(node) {
-    const rows = {};
-    for (const [index, weapon] of (node.vehicle_weapons || []).entries()) {
-      const prefix = index === 0 ? 'primary_gun' : index === 1 ? 'secondary_gun' : `other_gun_${index - 1}`;
-      rows[prefix] = weapon.display_name;
-      rows[`${prefix}_mount_count`] = weapon.mount_count;
-      rows[`${prefix}_caliber_mm`] = weapon.caliber_mm;
-      rows[`${prefix}_reload_time_seconds`] = weapon.reload_time_seconds;
-      rows[`${prefix}_rounds_before_reload`] = weapon.rounds_before_reload ?? 'Unknown';
-      rows[`${prefix}_rate_of_fire_rpm`] = weapon.rate_of_fire_rpm ?? 'Unknown';
-      rows[`${prefix}_ammunition`] = weapon.ammunition?.length
-        ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
-        : 'Unknown';
+  function weaponStats(node, hasVehicle) {
+    const weapons = (node.vehicle_weapons || []).map(weapon => ({...weapon}));
+    const carried = new Map();
+    for (const member of (hasVehicle || weapons.length ? [] : node.members || [])) {
+      for (const weapon of member.weapons || []) {
+        const key = weapon.id || weapon.display_name;
+        if (!carried.has(key)) carried.set(key, {...weapon, count: 0, carriers: new Set()});
+        const entry = carried.get(key);
+        entry.count += Number(member.count || 0);
+        entry.carriers.add(member.display_name || member.alias);
+      }
     }
-    return rows;
+    weapons.push(...carried.values());
+    if (!weapons.length) return statSection('Weapon stats', '<p class="muted">No weapon listed.</p>');
+    return statSection('Weapon stats', comparisonTable(
+      weapons.map(weapon => weapon.display_name || weapon.id),
+      [{title: 'Gun characteristics', values: weapons.map(weapon => ({
+        mount_count: weapon.mount_count,
+        carried_count: weapon.count,
+        carried_by: weapon.carriers ? [...weapon.carriers] : null,
+        caliber_mm: weapon.caliber_mm ?? 'Unknown',
+        indirect_fire_capability: weapon.indirect_fire ? 'Yes' : 'No',
+        reload_time_seconds: weapon.reload_time_seconds ?? 'Unknown',
+        rounds_before_reload: weapon.rounds_before_reload ?? 'Unknown',
+        rate_of_fire_rpm: weapon.rate_of_fire_rpm ?? 'Unknown',
+        ammunition: weapon.ammunition?.length
+          ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
+          : weapon.mount_count != null ? 'Unknown' : null,
+      }))}], 'Weapon comparison'
+    ));
+  }
+
+  function armorStats(node, hasVehicle) {
+    if (!hasVehicle) return '';
+    const parts = node.armor_parts || [];
+    if (!parts.length) return statSection('Armour stats', '<p class="muted">No armour values available.</p>');
+    const columns = [...new Set([
+      'default_mm', 'front_mm', 'left_mm', 'right_mm', 'rear_mm', 'top_mm', 'bottom_mm',
+      ...parts.flatMap(({part, ...values}) => Object.keys(values)),
+    ])].filter(key => parts.some(part => shown(part[key])));
+    const columnLabel = key => key === 'cast_steel_coefficient' ? 'Cast steel coefficient' : label(key.replace(/_mm$/, '')) + ' (mm)';
+    const rows = parts.map(part => {
+      const name = label(part.part.replace(/^body(?=\d|$)/i, 'hull').replace(/([a-z])(\d)/gi, '$1_$2'));
+      return `<tr><th scope="row">${esc(name)}</th>${columns.map(key => `<td>${shown(part[key]) ? esc(part[key]) : '—'}</td>`).join('')}</tr>`;
+    }).join('');
+    return statSection('Armour stats', `<p class="muted">Thickness in millimeters by part. Default applies to faces without an override. A dash means no explicit value is listed.</p><div class="comparison-scroll" tabindex="0" role="region" aria-label="Vehicle armour"><table class="comparison"><thead><tr><th scope="col">Part</th>${columns.map(key => `<th scope="col">${esc(columnLabel(key))}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`);
   }
 
   function renderDetails(node, required) {
@@ -2322,9 +2475,10 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const {raw, members, ...unitStats} = unit || {};
     const hasVehicle = unit && (unit.vehicle || unit.definition_type?.startsWith('vehicle') || unit.definition_type?.startsWith('squad_vehicle'));
     const unitTable = unit ? comparisonTable([hasVehicle ? (node.vehicle_display_name || node.display_name) : node.display_name], [
-      ...(hasVehicle ? [{title: 'Vehicle and gun stats', values: [{
-        ...vehicleWeaponRows(node),
+      ...(hasVehicle ? [{title: 'Vehicle stats', values: [{
         vehicle_speed_kmh: node.vehicle_speed_kmh,
+        turret_turn_speed_deg_s: node.turret_turn_speed_deg_s,
+        other_turret_turn_speeds: (node.turret_turn_speeds || []).slice(1).map(item => `${item.turret}: ${shown(item.degrees_per_second) ? number(item.degrees_per_second) + ' °/s' : 'Unknown'}`),
         front_armor_thickness_mm: node.front_armor_thickness_mm,
         maximum_armor_thickness_mm: node.maximum_armor_thickness_mm,
       }]}] : []),
@@ -2336,14 +2490,13 @@ html[data-theme="light"] .notice { background: #fff0d4; }
     const requirementNames = [...required].map(id => byId.get(id)?.display_name || id);
     detailContent.innerHTML = `
       <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
-      <div class="totals"><div class="total"><strong>${esc(number(node.cost))}</strong>Own RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
+      <div class="totals"><div class="total"><strong>${shown(node.stats?.command_points) ? esc(number(node.stats.command_points)) : '—'}</strong>CP</div><div class="total"><strong>${esc(number(node.cost))}</strong>RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
-      ${statSection('Research data', statRows({cost: node.cost}), false)}
-      ${firepowerStats(node)}
+      ${weaponStats(node, hasVehicle)}
+      ${armorStats(node, hasVehicle || node.vehicle_weapons?.length)}
       ${statSection('Aggregate unit stats', statRows({...node.stats, unit_class: node.unit_class, unit_level: node.unit_level_label, inventory: (node.inventory_types || []).map(type => inventoryLabels[type] || type), weapon_roles: (node.weapon_roles || []).map(role => weaponRoleLabels[role] || role), specialist_types: (node.specialist_types || []).map(type => specialistLabels[type] || type), carries_shovel: node.unit_class === 'infantry' ? (node.has_shovel ? 'Yes' : 'No') : null, includes_scout: node.unit_class === 'infantry' ? (node.has_scout ? 'Yes' : 'No') : null, includes_sniper: node.unit_class === 'infantry' ? (node.has_sniper ? 'Yes' : 'No') : null, anti_tank_equipped_infantry: node.anti_tank_weapon_count || null, at_cannon: node.at_cannon ? 'Yes' : 'No', vehicle_speed_kmh: node.vehicle_speed_kmh, front_armor_thickness_mm: node.front_armor_thickness_mm, maximum_armor_thickness_mm: node.maximum_armor_thickness_mm, primary_weapon: node.primary_weapon, main_gun_caliber_mm: node.main_gun_caliber_mm, reload_time_seconds: node.reload_time}), false)}
       ${statSection(`${hasVehicle ? 'Vehicle / gun' : 'Formation'} stats`, unitTable)}
       ${memberTables(node)}
-      ${statSection('Other', statRows({indirect_fire_capability: node.indirect_fire ? 'Yes' : 'No'}))}
       ${statSection(`Unlock prerequisites (${required.size})`, requirementNames.length ? `<div class="chips">${requirementNames.map(name => `<span class="chip">${esc(name)}</span>`).join('')}</div>` : '<p class="muted">No prerequisites</p>')}`;
     restoreSectionStates(detailContent, 'stats');
   }
@@ -2477,7 +2630,7 @@ html[data-theme="light"] .notice { background: #fff0d4; }
       else resizeStatsPanel(statsWidth);
     }, 210);
   });
-  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput, hasIndirectFireInput, ...firepowerControls.values()];
+  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values()];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
@@ -2487,8 +2640,8 @@ html[data-theme="light"] .notice { background: #fff0d4; }
   }
   branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); fitTree(); });
   document.getElementById('clear-filters').addEventListener('click', () => {
-    for (const input of [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minFrontArmorInput, minCaliberInput, maxReloadInput, maxCpInput]) input.value = '';
-    for (const input of firepowerControls.values()) input.value = '';
+    for (const input of filterControls) if (input.type === 'number') input.value = '';
+    armourPartInput.value = 'main';
     hasIndirectFireInput.checked = false;
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
     updateFilterSummaries(); applyFilters(); fitTree();

@@ -48,6 +48,43 @@ class IndirectFireIntegrationTests(unittest.TestCase):
         self.resource = Path(temporary.name) / 'resource'
         self.resource.mkdir()
 
+    def test_close_support_howitzers_include_secondary_and_inherited_guns(self):
+        pak(self.resource / 'gamelogic.pak', {
+            'set/stuff/gun/.presets': '''
+                (define "curved_firing_arc" {gravity 5.5})
+                (define "indirect_settings" {aimtype curved})
+                (define "range_160_howitzer"
+                    ("curved_firing_arc") {range 160 160} ("indirect_settings"))
+                (define "direct_settings" {aimtype direct})
+            ''',
+            'set/stuff/gun/76mm_qf3':
+                '{from "pattern gun" ("range_160_howitzer") {calibre 76}}',
+            'set/stuff/gun/inherited_howitzer': '{from "76mm_qf3"}',
+            'set/stuff/gun/direct_gun': '("direct_settings") {calibre 88}',
+            'set/stuff/gun/spigot_mortar': '("direct_settings") {gravity 1}',
+            'set/stuff/gun/gun.pattern': '{aimtype direct}',
+        })
+        pak(self.resource / 'entity/vehicle.pak', {
+            '-vehicle/tank_heavy/churchill.def': '''{Weaponry
+                {place "gun" {weapon "direct_gun"}}
+                {place "secondary" {weapon "76mm_qf3"}}
+            }''',
+            '-vehicle/tank_medium/support.def':
+                '{Weaponry {place "gun" {weapon "inherited_howitzer"}}}',
+            '-vehicle/tank_heavy/avre.def':
+                '{Weaponry {place "gun" {weapon "spigot_mortar"}}}',
+        })
+        nodes = [{'id': name} for name in ('churchill', 'support', 'avre')]
+        with GameData(self.resource) as data:
+            count, *_ = annotate_unit_metadata([{'faction': 'eng', 'nodes': nodes}],
+                                               data.view('entity/'), data.view(), {})
+        self.assertEqual(count, 2)
+        self.assertEqual([node['indirect_fire'] for node in nodes], [True, True, False])
+        self.assertTrue(all(node['unit_class'] == 'tanks' for node in nodes))
+        self.assertEqual({w['id']: w['indirect_fire'] for w in nodes[0]['vehicle_weapons']},
+                         {'direct_gun': False, '76mm_qf3': True})
+        self.assertTrue(nodes[1]['vehicle_weapons'][0]['indirect_fire'])
+
     def test_shared_cannon_properties_do_not_make_supply_trailer_artillery(self):
         shared = '(define "abm_dymamic_mortar" ("accuracy_by_motion" max_linear(5)))'
         pak(self.resource / 'properties.pak', {'properties/cannon.ext': shared})
