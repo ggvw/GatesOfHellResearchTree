@@ -1,0 +1,79 @@
+name: Deploy release to GitHub Pages
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Download and validate release website
+    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download research_tree_html.zip from the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ github.event.release.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --jq '.assets[] | select(.name == "research_tree_html.zip") | .id')
+          if [[ -z "$asset_id" ]]; then
+            echo "::error::Published release $RELEASE_ID is missing the required asset research_tree_html.zip. Attach it before publishing the release."
+            exit 1
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+            -H "Accept: application/octet-stream" \
+            > "$RUNNER_TEMP/research_tree_html.zip"
+
+      - name: Extract and validate the website
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/research_tree_html.zip"
+          site="$RUNNER_TEMP/release-site"
+          if [[ ! -f "$archive" ]]; then
+            echo "::error::Required release asset research_tree_html.zip was not downloaded."
+            exit 1
+          fi
+          mkdir -p "$site"
+          if ! unzip -q "$archive" -d "$site"; then
+            echo "::error::Could not extract research_tree_html.zip. Ensure the release asset is a valid ZIP archive."
+            exit 1
+          fi
+          if [[ ! -f "$site/index.html" ]]; then
+            echo "::error::research_tree_html.zip must contain index.html at its root, alongside assets/. Do not include a wrapping research_tree_html/ directory."
+            exit 1
+          fi
+
+      - name: Upload the extracted website for GitHub Pages
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/release-site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy the release website
+        id: deployment
+        uses: actions/deploy-pages@v4
