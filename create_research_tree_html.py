@@ -562,28 +562,90 @@ def sdl_number(expression: str) -> float | None:
         return None
 
 
+def expand_numeric_presets(text: str, templates: dict, active=frozenset()) -> str:
+    """Expand named numeric presets, preserving unknown and recursive calls."""
+    invocation = re.compile(r'\(\s*"([^"\n]+)"((?:\s+\w+\([^()]*\))*)\s*\)')
+    def replace(match):
+        name = match[1]
+        if name not in templates or name in active or len(active) >= 64:
+            return match[0]
+        arguments = dict(re.findall(r'(\w+)\(([^()]*)\)', match[2]))
+        body = re.sub(r'^\(define\s+"[^"]+"', '', templates[name])[:-1]
+        body = re.sub(r'%(\w+)', lambda item: arguments.get(item[1], item[0]), body)
+        return expand_numeric_presets(body, templates, active | {name})
+    return invocation.sub(replace, text)
+
+
+def weapon_range_settings(text: str, presets: dict, inherited: dict | None = None) -> dict:
+    """Keep base weapon ranges separate from ammunition-specific overrides."""
+    inherited = inherited or {'default': {}, 'ammo': {}}
+    result = {'default': dict(inherited['default']),
+              'ammo': {name: dict(values) for name, values in inherited['ammo'].items()}}
+    text = expand_numeric_presets(active_definition_text(text), presets)
+    # Fold safe arithmetic before reading scalar range arguments.
+    for _ in range(64):
+        def fold(match):
+            value = sdl_number(match[0])
+            return str(value) if value is not None else match[0]
+        expanded = re.sub(r'\([+*/-]\s+[^()]+\)', fold, text)
+        if expanded == text:
+            break
+        text = expanded
+
+    def walk(value, ammo=None):
+        position = 0
+        while match := re.search(r'[({]', value[position:]):
+            start = position + match.start()
+            opening = value[start]
+            closing = ')' if opening == '(' else '}'
+            depth, end = 0, None
+            for token in re.finditer(r'"(?:\\.|[^"\\])*"|[{}()]', value[start:]):
+                if token[0] == opening:
+                    depth += 1
+                elif token[0] == closing:
+                    depth -= 1
+                    if depth == 0:
+                        end = start + token.end()
+                        break
+            if end is None:
+                return
+            block = value[start:end]
+            position = end
+            if opening == '(':
+                continue  # Conditional modes and unknown calls are not active settings.
+            key = re.match(r'\{\s*([a-z_]+)\b', block, re.I)
+            if not key:
+                continue
+            name = key[1].lower()
+            body = block[key.end():-1].strip()
+            if name == 'parameters':
+                parameter = re.match(r'"([^"]+)"', body)
+                if parameter:
+                    walk(body[parameter.end():], parameter[1].lower())
+            elif name in {'from', 'weapon', 'weapon_bullet', 'weapon_throw'}:
+                walk(body, ammo)
+            elif name in {'range', 'aimrange', 'maxrange', 'minrange'}:
+                keys = {'range': ['ai_range_m', 'direct_control_range_m'],
+                        'aimrange': ['ai_range_m'], 'maxrange': ['direct_control_range_m'],
+                        'minrange': ['minimum_firing_range_m']}[name]
+                values = body.split()
+                target = result['default'] if ammo is None else result['ammo'].setdefault(ammo, {})
+                for index, field in enumerate(keys):
+                    number = sdl_number(values[index]) if index < len(values) else None
+                    target[field] = number if number is not None and number >= 0 else None
+    walk(text)
+    return result
+
+
 def turret_turn_speeds(definition_text: str) -> list[dict]:
     """Resolve turret bone speed2 values, including parameterized presets."""
     text = re.sub(r';[^\r\n]*', '', definition_text)
     templates = _named_parenthesized_blocks(text, '(define ')
-    invocation = re.compile(r'\(\s*"([^"\n]+)"((?:\s+\w+\([^()]*\))*)\s*\)')
-
-    def expand(text, active=frozenset()):
-        def replace(match):
-            name = match[1]
-            if name not in templates or name in active or len(active) >= 64:
-                return match[0]
-            arguments = dict(re.findall(r'(\w+)\(([^()]*)\)', match[2]))
-            body = re.sub(r'^\(define\s+"[^"]+"', '', templates[name])[:-1]
-            body = re.sub(r'%(\w+)', lambda item: arguments.get(item[1], item[0]), body)
-            return expand(body, active | {name})
-        return invocation.sub(replace, text)
-
     speeds = {}
     active_text = active_definition_text(text)
     for match in re.finditer(r'\{bone\s+"((?:aux_)?turret[^"\s]*)"', active_text, re.I):
         # Work with the active text so uninvoked shared presets cannot add turrets.
-        block = expand(brace_section(active_text[match.start():], 'bone'))
+        block = expand_numeric_presets(brace_section(active_text[match.start():], 'bone'), templates)
         values = list(re.finditer(r'\{speed2\s+([^{}]+)\}', block, re.I))
         if values:
             value = sdl_number(values[-1][1])
@@ -1195,12 +1257,44 @@ def annotate_unit_metadata(
                     rate = 60 / reload_time
             return round(rate, 2) if rate is not None else None
 
+        range_cache = {}
+
+        def inherited_weapon_ranges(reference, active=frozenset()):
+            reference = re.sub(r'^weapon\s+', '', reference.strip(), flags=re.I).lower()
+            if reference in range_cache:
+                return range_cache[reference]
+            empty = {'default': {}, 'ammo': {}}
+            if reference in active or len(active) >= 64:
+                return empty
+            for path in weapon_files.get(reference, []):
+                text = re.sub(r';[^\r\n]*', '', gamelogic.read(path).decode(errors='replace'))
+                parent = re.search(r'\{from\s+"([^"]+)"', text, re.I)
+                inherited = empty
+                if parent:
+                    name = parent[1]
+                    if name.startswith('pattern '):
+                        name = name.removeprefix('pattern ') + '.pattern'
+                    inherited = inherited_weapon_ranges(name, active | {reference})
+                presets = {**preset_blocks, **_named_parenthesized_blocks(text, '(define ')}
+                result = weapon_range_settings(text, presets, inherited)
+                range_cache[reference] = result
+                return result
+            return empty
+
+        def weapon_range_stats(reference):
+            settings = inherited_weapon_ranges(reference)
+            return {**settings['default'], 'ammunition_ranges': [
+                {'ammunition': name, **settings['default'], **values}
+                for name, values in settings['ammo'].items()
+            ]}
+
         for tree in trees:
             for node in tree["nodes"]:
                 unit = node.get("unit") or {}
                 for member in node.get("members") or []:
                     annotate_member_weapons(member, handheld_weapon_categories)
                     for weapon in member["weapons"]:
+                        weapon.update(weapon_range_stats(weapon["id"]))
                         weapon["indirect_fire"] = weapon_indirect_fire(weapon["id"])
                         weapon["rounds_before_reload"] = weapon_filling(weapon["id"])[1]
                         weapon["rate_of_fire_rpm"] = weapon_fire_rate(weapon["id"])
@@ -1269,6 +1363,7 @@ def annotate_unit_metadata(
                     name = re.sub(r"<c\([^)]*\)>(.*?)</c>", r"\1", name)
                     node["vehicle_weapons"].append({
                         "id": reference, "display_name": name,
+                        **weapon_range_stats(reference),
                         "indirect_fire": weapon_indirect_fire(reference),
                         "mount_count": weapon_mount_counts[reference],
                         "caliber_mm": caliber, "reload_time_seconds": reload_time,
@@ -1807,6 +1902,15 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label title="Minimum configured turn speed of the main turret; unknown speeds do not match">Min turret turn speed (°/s) <input id="min-turret-turn-speed" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
+    <details class="multi-filter" id="range-filter">
+      <summary>Firing range</summary>
+      <div class="firepower-controls">
+        <label>Min AI range (m) <input id="min-ai-range" type="number" min="0" step="1" placeholder="Any"></label>
+        <label>Min direct-control range (m) <input id="min-direct-control-range" type="number" min="0" step="1" placeholder="Any"></label>
+        <label>Max minimum firing distance (m) <input id="max-minimum-firing-range" type="number" min="0" step="1" placeholder="Any"></label>
+      </div>
+      <p class="muted metric-help">Configured ranges of the largest-calibre weapon. Filters use its default ammunition settings; ammunition overrides are listed in Weapon stats. Direct-control limits can vary by game mode. Unknown values do not match.</p>
+    </details>
   </details>
   <details class="filter-group" id="armour-filter">
     <summary>Armour</summary>
@@ -1837,6 +1941,7 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
   <table id="unit-table"><thead><tr>
     <th scope="col">Unit name</th><th scope="col">CP</th><th scope="col">RP</th>
     <th scope="col">Total RP</th><th scope="col">Unit size</th><th scope="col">Gun calibre (mm)</th>
+    <th scope="col">AI range (m)</th><th scope="col">Direct-control range (m)</th><th scope="col">Minimum firing distance (m)</th>
     <th scope="col">Reload time (s)</th><th scope="col">Rate of fire (RPM)</th><th scope="col">Speed (km/h)</th>
   </tr></thead><tbody id="unit-table-body"></tbody></table>
 </section>
@@ -1886,6 +1991,11 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
     armourControls.set(face, control.querySelector('input'));
   }
   const minCaliberInput = document.getElementById('min-caliber');
+  const gunRangeControls = [
+    {field: 'ai_range_m', input: document.getElementById('min-ai-range'), minimum: true},
+    {field: 'direct_control_range_m', input: document.getElementById('min-direct-control-range'), minimum: true},
+    {field: 'minimum_firing_range_m', input: document.getElementById('max-minimum-firing-range'), minimum: false},
+  ];
   const maxReloadInput = document.getElementById('max-reload');
   const minTurretTurnSpeedInput = document.getElementById('min-turret-turn-speed');
   const maxCpInput = document.getElementById('max-cp');
@@ -1905,7 +2015,11 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
   let scale = 1, tx = 0, ty = 0, dragging = false, dragStart, panMoved = false;
 
   const esc = value => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-  const label = key => key === 'turret_turn_speed_deg_s' ? 'Turret turn speed (°/s)' : key.replace(/armor/gi, 'armour').replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
+  const statLabels = {
+    turret_turn_speed_deg_s: 'Turret turn speed (°/s)', ai_range_m: 'AI firing range (m)',
+    direct_control_range_m: 'Direct-control range (m)', minimum_firing_range_m: 'Minimum firing distance (m)',
+  };
+  const label = key => statLabels[key] || key.replace(/armor/gi, 'armour').replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   const shown = value => value !== null && value !== undefined && value !== '' && (!Array.isArray(value) || value.length);
   const number = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
 
@@ -2150,11 +2264,12 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
     const body = document.getElementById('unit-table-body');
     body.replaceChildren();
     unitRows.clear();
-    const columns = ['CP', 'RP', 'Total RP', 'Unit size', 'Gun calibre (mm)', 'Reload time (s)', 'Rate of fire (RPM)', 'Speed (km/h)'];
+    const columns = ['CP', 'RP', 'Total RP', 'Unit size', 'Gun calibre (mm)', 'AI range (m)', 'Direct-control range (m)', 'Minimum firing distance (m)', 'Reload time (s)', 'Rate of fire (RPM)', 'Speed (km/h)'];
     for (const node of tree.nodes.filter(node => node.unit)) {
       const gun = largestGun(node);
       const values = [node.stats?.command_points ?? node.unit.cp, node.cost, totalResearchPoints(node),
-        node.stats?.unit_count, gun?.caliber_mm, gun?.reload_time_seconds, gun?.rate_of_fire_rpm, node.unit_speed_kmh];
+        node.stats?.unit_count, gun?.caliber_mm, gun?.ai_range_m, gun?.direct_control_range_m, gun?.minimum_firing_range_m,
+        gun?.reload_time_seconds, gun?.rate_of_fire_rpm, node.unit_speed_kmh];
       const row = document.createElement('tr');
       row.dataset.nodeId = node.id;
       row.innerHTML = `<th scope="row"><button type="button" class="unit-name">${esc(node.display_name)}</button></th>`
@@ -2304,12 +2419,13 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
     const hasMinTurretTurnSpeed = minTurretTurnSpeedInput.value !== '';
     const hasMaxCp = maxCpInput.value !== '';
     const firepowerFilters = [...firepowerControls].filter(([, input]) => input.value !== '');
+    const rangeFilters = gunRangeControls.filter(control => control.input.value !== '');
     const indirectFireOnly = hasIndirectFireInput.checked;
     const selectedInventory = selectedValues(inventoryOptions);
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length;
+    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
@@ -2328,7 +2444,7 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
       const unitLevel = node.unit_level;
       const infantryAt = node.anti_tank_weapon_count;
       const unitSpeed = node.unit_speed_kmh;
-      const gun = viewMode === 'table' ? largestGun(node) : null;
+      const gun = largestGun(node);
       const primaryRounds = viewMode === 'table' ? gun?.rounds_before_reload : node.primary_rounds_before_reload;
       const primaryRate = viewMode === 'table' ? gun?.rate_of_fire_rpm : node.primary_rate_of_fire_rpm;
       const caliber = viewMode === 'table' ? gun?.caliber_mm : node.main_gun_caliber_mm;
@@ -2346,6 +2462,8 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
         && (!hasMinTurretTurnSpeed || (Number.isFinite(node.turret_turn_speed_deg_s) && node.turret_turn_speed_deg_s >= minTurretTurnSpeed))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
+        && rangeFilters.every(({field, input, minimum}) => Number.isFinite(gun?.[field])
+          && (minimum ? gun[field] >= Number(input.value) : gun[field] <= Number(input.value)))
         && firepowerFilters.every(([key, input]) => {
           const [slot, metric] = key.split('.');
           const value = node.firepower?.[slot]?.[metric];
@@ -2546,6 +2664,12 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
         reload_time_seconds: weapon.reload_time_seconds ?? 'Unknown',
         rounds_before_reload: weapon.rounds_before_reload ?? 'Unknown',
         rate_of_fire_rpm: weapon.rate_of_fire_rpm ?? 'Unknown',
+        ai_range_m: weapon.ai_range_m ?? 'Unknown',
+        direct_control_range_m: weapon.direct_control_range_m ?? 'Unknown',
+        minimum_firing_range_m: weapon.minimum_firing_range_m ?? 'Unknown',
+        ammunition_firing_ranges: (weapon.ammunition_ranges || []).map(range =>
+          `${range.ammunition.toUpperCase()}: ` + [['ai_range_m', 'AI'], ['direct_control_range_m', 'direct control'], ['minimum_firing_range_m', 'minimum']]
+            .filter(([key]) => Number.isFinite(range[key])).map(([key, name]) => `${name} ${number(range[key])} m`).join('; ')),
         ammunition: weapon.ammunition?.length
           ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
           : weapon.mount_count != null ? 'Unknown' : null,
@@ -2738,7 +2862,7 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
       else resizeStatsPanel(statsWidth);
     }, 210);
   });
-  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values()];
+  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();

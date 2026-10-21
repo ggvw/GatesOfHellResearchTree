@@ -29,6 +29,7 @@ maintained database.
 - Localized main, secondary, and additional carried weapons for each soldier
 - Localized vehicle guns and machine guns, with calibre and reload statistics
 - Turret turn speeds in degrees per second, with a minimum-speed filter
+- Configured AI, direct-control, and minimum firing ranges, with ammunition overrides and range filters
 - Per-gun ammunition types and counts, including spare and loaded rounds
 - Rounds before reload for infantry and vehicle weapons, with a primary-weapon
   minimum-capacity filter in Weapons
@@ -46,7 +47,8 @@ Choose Graph or Table in the top bar. Graph mode highlights matching nodes;
 Table mode lists matching units and removes rows that do not match. Search and
 branch selections also filter table rows. Table columns show unit name, CP, RP,
 total RP including shared prerequisites counted once, unit size, gun calibre,
-reload time, rate of fire, and movement speed. Select a unit name to open its
+AI range, direct-control range, minimum firing distance, reload time, rate of
+fire, and movement speed. Select a unit name to open its
 statistics. Missing values appear as a dash. On small screens the table uses
 labelled rows, and filters can be opened with the side button. The viewer starts
 in Table mode on small screens and remembers an explicit view choice.
@@ -65,7 +67,7 @@ those values. Selections from different filter groups are combined, so a unit
 must satisfy every active group.
 
 Filters are grouped into General (CP, size, speed), Infantry (level and equipment),
-Weapons (calibre, capacity, rate, reload, turret turn speed, indirect fire), Armour, and Firepower
+Weapons (calibre, capacity, rate, reload, turret turn speed, range, indirect fire), Armour, and Firepower
 estimates.
 
 The General section's Min speed (km/h) filter sets a minimum movement speed.
@@ -100,6 +102,18 @@ separately. Values come from turret bone settings, including arithmetic in
 parameterized presets; a preset's `power_traverse` argument is not itself the
 final turn speed. Gun elevation, hull traverse, and commander optics are excluded.
 Missing or unsupported values do not match the filter. Mod overrides are respected.
+
+The Weapons section's Firing range filters set minimum AI and direct-control
+ranges, or a maximum minimum firing distance to find weapons that can fire
+closer. Ranges are configured game distances in meters, not historical ranges.
+`range` specifies AI and direct-control ranges separately; `minRange` is a
+separate minimum firing distance and is only shown when explicitly available.
+Weapon stats shows each gun's default ranges and ammunition-specific overrides
+(for example, a gun may have 200 m default range but 180 m with HE).
+Range filters and table columns use the largest-calibre weapon's default settings
+in both views. Unknown values do not match filters, including a zero threshold.
+Presets, weapon inheritance, and mod overrides are respected. Game mode and
+direct-control settings can permit firing beyond the configured range.
 
 Indirect fire includes mortar and artillery entity settings, the PIAT carried by
 infantry, the Sturmmörser’s RW61 rocket mortar, and mounted weapons with curved-fire
