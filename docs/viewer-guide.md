@@ -35,11 +35,19 @@ Choose Graph or Table in the top bar. Graph mode highlights matching nodes;
 Table mode lists matching units and removes rows that do not match. Search and
 branch selections also filter table rows. Table columns show unit name, CP, RP,
 total RP including shared prerequisites counted once, unit size, gun calibre,
-AI range, direct-control range, minimum firing distance, reload time, rate of
+weapon range, indirect fire (Yes/No), reload time, rate of
 fire, and movement speed. Select a unit name to open its
 statistics. Missing values appear as a dash. On small screens the table uses
 labelled rows, and filters can be opened with the side button. The viewer starts
 in Table mode on small screens and remembers an explicit view choice.
+
+Click or tap a column heading to cycle through ascending, descending, and
+unsorted. Each new column is added to the existing sort order. Arrows and numbers
+show direction and priority; removing a column promotes those after it.
+Cycle all sorted columns back to unsorted to restore research-tree order.
+Unknown values stay at the bottom in either direction. Sorting is retained
+when filtering or switching factions and views.
+Weapon range shows the largest-calibre weapon's configured AI firing range.
 
 In Table mode, gun calibre, reload time, RPM, and capacity filters use the
 largest-calibre weapon in the unit. Vehicles use mounted weapons only; infantry

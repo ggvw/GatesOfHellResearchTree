@@ -29,4 +29,28 @@ assert.equal(totalResearchPoints(nodes[3]), 17); // Shared prerequisites counted
 assert.equal(totalResearchPoints(nodes[0]), 2);
 context.byId.set('cycle', {id: 'cycle', cost: 4, requires: ['cycle', 'base']});
 assert.equal(totalResearchPoints(context.byId.get('cycle')), 6);
-console.log('9 unit table checks passed.');
+const sortCode = source.slice(source.indexOf('  function nextTableSort('), source.indexOf('  const tableHeaders'));
+const {nextTableSort, compareTableValues} = vm.runInContext(sortCode + '\n({nextTableSort, compareTableValues})', context);
+const plain = value => JSON.parse(JSON.stringify(value));
+const first = nextTableSort([], 1);
+assert.deepEqual(plain(first), [{column: 1, direction: 'asc'}]);
+const multiple = nextTableSort(first, 2);
+assert.deepEqual(plain(multiple), [{column: 1, direction: 'asc'}, {column: 2, direction: 'asc'}]);
+const secondaryDescending = nextTableSort(multiple, 2);
+assert.deepEqual(plain(secondaryDescending), [{column: 1, direction: 'asc'}, {column: 2, direction: 'desc'}]);
+assert.deepEqual(plain(nextTableSort(secondaryDescending, 2)), [{column: 1, direction: 'asc'}]);
+const primaryDescending = nextTableSort(multiple, 1);
+assert.deepEqual(plain(primaryDescending), [{column: 1, direction: 'desc'}, {column: 2, direction: 'asc'}]);
+assert.deepEqual(plain(nextTableSort(primaryDescending, 1)), [{column: 2, direction: 'asc'}]);
+assert.deepEqual(plain(nextTableSort(nextTableSort(first, 1), 1)), []);
+assert.deepEqual(plain(nextTableSort(nextTableSort(secondaryDescending, 2), 2)), plain(multiple));
+assert.deepEqual(plain(first), [{column: 1, direction: 'asc'}]); // No mutation.
+assert.ok(compareTableValues(['A', 2], ['B', 10], first) < 0);
+assert.ok(compareTableValues(['A', 0], ['B', 1], first) < 0);
+assert.ok(compareTableValues(['A', null], ['B', 1], first) > 0);
+assert.ok(compareTableValues(['A', null], ['B', 1], [{column: 1, direction: 'desc'}]) > 0);
+assert.ok(compareTableValues(['A', 2, 10], ['B', 2, 3], multiple) > 0);
+assert.ok(compareTableValues(['Tank 2'], ['Tank 10'], [{column: 0, direction: 'asc'}]) < 0);
+assert.ok(compareTableValues([false], [true], [{column: 0, direction: 'asc'}]) < 0);
+assert.equal(compareTableValues(['A', 2], ['B', 2], first), 0); // Preserve source order for ties.
+console.log('Unit table and sorting checks passed.');

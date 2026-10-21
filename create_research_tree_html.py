@@ -1674,6 +1674,7 @@ HTML_TEMPLATE = r'''<!doctype html>
 <title>Gates of Hell Research Trees</title>
 <style>
 :root { color-scheme: dark; --panel: #171b1d; --line: #6d7779; --accent: #e0ad4f; --required: #67c7f4; }
+:root { --table-background: #0c0f10; --table-surface: #171b1d; --table-header: #252d30; --table-alternate: #1d2326; --table-hover: #29373b; --table-selected: #344329; --table-border: #495154; --table-muted: #aeb8bb; }
 * { box-sizing: border-box; }
 html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #0c0f10; color: #e9ecea; font: 14px/1.4 system-ui, sans-serif; }
 button, select, input { color: inherit; background: #252b2e; border: 1px solid #596164; border-radius: 5px; padding: 7px 10px; }
@@ -1712,20 +1713,26 @@ body.filters-collapsed #filter-toggle { left: 0; }
 body.stats-open #viewport { right: var(--stats-width, 560px); }
 body.filters-collapsed #viewport { left: 0; }
 #viewport.dragging { cursor: grabbing; }
-#table-view { position: absolute; inset: 54px 0 0 300px; overflow: auto; padding: 12px 18px 24px 38px; }
+#table-view { position: absolute; inset: 54px 0 0 300px; overflow: auto; padding: 6px 18px 24px 38px; background: var(--table-background); }
 #table-view[hidden], #viewport[hidden] { display: none; }
 body.filters-collapsed #table-view { left: 0; }
 body.stats-open #table-view { right: var(--stats-width, 560px); }
 body.table-mode .graph-control, body.table-mode #hint { display: none; }
 #unit-table { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
-#unit-table th, #unit-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; background: var(--panel); }
-#unit-table thead th { position: sticky; top: 0; z-index: 2; }
+#unit-table th, #unit-table td { padding: 10px 12px; border-bottom: 1px solid var(--table-border); text-align: right; white-space: nowrap; background: var(--table-surface); }
+#unit-table thead th { position: sticky; top: 0; z-index: 2; background: var(--table-header); }
 #unit-table th:first-child { text-align: left; position: sticky; left: 0; z-index: 1; white-space: normal; min-width: 180px; }
 #unit-table thead th:first-child { z-index: 3; }
-#unit-table tr.selected > * { background: #344329; }
+#unit-table tbody tr:nth-child(even) > * { background: var(--table-alternate); }
+#unit-table tbody tr:hover > *, #unit-table tbody tr:focus-within > * { background: var(--table-hover); }
+#unit-table tbody tr.selected > * { background: var(--table-selected); }
 #unit-table .unit-name { text-align: left; width: 100%; min-height: 40px; background: transparent; border-color: transparent; }
 #unit-table .unit-name:hover, #unit-table .unit-name:focus-visible { border-color: var(--accent); }
-#table-status { margin: 0 0 10px; }
+#unit-table .sort-column { color: inherit; background: transparent; border: 0; border-radius: 0; padding: 4px 0; width: 100%; text-align: inherit; font: inherit; cursor: pointer; }
+#unit-table .sort-column:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.sort-indicator { color: var(--table-muted); margin-left: 5px; }
+#table-status { margin: 0 0 4px; }
+#table-sort-status { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
 #edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
 .edge { stroke: var(--line); stroke-width: 3; fill: none; opacity: .7; }
@@ -1825,21 +1832,22 @@ html[data-theme="light"] .comparison thead th, html[data-theme="light"] .compari
 html[data-theme="light"] .comparison .comparison-section th { background: #dce3df; color: #754900; }
 html[data-theme="light"] .chip { background: #dce3df; }
 html[data-theme="light"] .notice { background: #fff0d4; }
-html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
+html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7; --table-header: #dce5e0; --table-alternate: #edf2ee; --table-hover: #dce8e0; --table-selected: #c6e4cf; --table-border: #b8c4bc; --table-muted: #53615a; }
 @media (max-width: 1000px) { #hint { display: none; } }
 @media (max-width: 760px) { #filter-panel { width: min(300px, 86vw); } #filter-toggle { left: min(300px, 86vw); } #viewport { left: 0; } }
 @media (max-width: 760px) {
   #table-view, body.stats-open #table-view { left: 0; right: 0; }
-  #unit-table thead { display: none; }
+  #unit-table thead { display: block; margin-bottom: 12px; }
+  #unit-table thead tr { display: flex; flex-wrap: wrap; gap: 5px; border: 0; }
+  #unit-table thead th { position: static; padding: 5px 8px; border: 1px solid var(--table-border); border-radius: 4px; white-space: nowrap; }
   #unit-table, #unit-table tbody { display: block; }
-  #unit-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 6px; margin-bottom: 12px; overflow: hidden; }
+  #unit-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--table-border); border-radius: 6px; margin-bottom: 12px; overflow: hidden; }
   #unit-table tr[hidden] { display: none; }
   #unit-table td { display: flex; flex-direction: column; text-align: left; white-space: normal; min-width: 0; }
-  #unit-table td::before { content: attr(data-label); color: #9ea7a9; font-size: 12px; }
+  #unit-table td::before { content: attr(data-label); color: var(--table-muted); font-size: 12px; }
   #unit-table th:first-child { grid-column: 1 / -1; position: static; min-width: 0; }
   body.table-mode #details { width: 100%; }
   body.table-mode #stats-resize { display: none; }
-  html[data-theme="light"] #unit-table td::before { color: #626e70; }
 }
 </style>
 </head>
@@ -1937,11 +1945,11 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
 <main id="viewport"><div id="world"><svg id="edges"></svg><div id="nodes"></div></div></main>
 <section id="table-view" aria-label="Unit table" hidden>
   <p id="table-status" role="status"></p>
-  <p class="muted">Gun stats use the largest-calibre weapon. Select a unit for its statistics.</p>
+  <p id="table-sort-status" aria-live="polite"></p>
   <table id="unit-table"><thead><tr>
     <th scope="col">Unit name</th><th scope="col">CP</th><th scope="col">RP</th>
     <th scope="col">Total RP</th><th scope="col">Unit size</th><th scope="col">Gun calibre (mm)</th>
-    <th scope="col">AI range (m)</th><th scope="col">Direct-control range (m)</th><th scope="col">Minimum firing distance (m)</th>
+    <th scope="col">Weapon range (m)</th><th scope="col">Indirect fire</th>
     <th scope="col">Reload time (s)</th><th scope="col">Rate of fire (RPM)</th><th scope="col">Speed (km/h)</th>
   </tr></thead><tbody id="unit-table-body"></tbody></table>
 </section>
@@ -1962,6 +1970,8 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
   const tableView = document.getElementById('table-view');
   const viewModeInput = document.getElementById('view-mode');
   const unitRows = new Map();
+  const tableValues = new Map();
+  let tableSort = [];
   let viewMode = 'graph';
   const world = document.getElementById('world');
   const edgesLayer = document.getElementById('edges');
@@ -2264,20 +2274,74 @@ html[data-theme="light"] #unit-table tr.selected > * { background: #d5ead7; }
     const body = document.getElementById('unit-table-body');
     body.replaceChildren();
     unitRows.clear();
-    const columns = ['CP', 'RP', 'Total RP', 'Unit size', 'Gun calibre (mm)', 'AI range (m)', 'Direct-control range (m)', 'Minimum firing distance (m)', 'Reload time (s)', 'Rate of fire (RPM)', 'Speed (km/h)'];
+    tableValues.clear();
+    const columns = ['CP', 'RP', 'Total RP', 'Unit size', 'Gun calibre (mm)', 'Weapon range (m)', 'Indirect fire', 'Reload time (s)', 'Rate of fire (RPM)', 'Speed (km/h)'];
     for (const node of tree.nodes.filter(node => node.unit)) {
       const gun = largestGun(node);
       const values = [node.stats?.command_points ?? node.unit.cp, node.cost, totalResearchPoints(node),
-        node.stats?.unit_count, gun?.caliber_mm, gun?.ai_range_m, gun?.direct_control_range_m, gun?.minimum_firing_range_m,
+        node.stats?.unit_count, gun?.caliber_mm, gun?.ai_range_m, !!node.indirect_fire,
         gun?.reload_time_seconds, gun?.rate_of_fire_rpm, node.unit_speed_kmh];
       const row = document.createElement('tr');
       row.dataset.nodeId = node.id;
       row.innerHTML = `<th scope="row"><button type="button" class="unit-name">${esc(node.display_name)}</button></th>`
-        + values.map((value, index) => `<td data-label="${esc(columns[index])}">${Number.isFinite(value) ? esc(number(value)) : '—'}</td>`).join('');
+        + values.map((value, index) => `<td data-label="${esc(columns[index])}">${typeof value === 'boolean' ? (value ? 'Yes' : 'No') : Number.isFinite(value) ? esc(number(value)) : '—'}</td>`).join('');
       row.querySelector('button').addEventListener('click', () => selectNode(node.id));
       body.append(row);
       unitRows.set(node.id, row);
+      tableValues.set(node.id, [node.display_name, ...values]);
     }
+    applyTableSort();
+  }
+
+  function nextTableSort(current, column) {
+    const existing = current.find(sort => sort.column === column);
+    if (!existing) return [...current, {column, direction: 'asc'}];
+    if (existing.direction === 'desc') return current.filter(sort => sort.column !== column);
+    return current.map(sort => sort.column === column ? {column, direction: 'desc'} : sort);
+  }
+
+  function compareTableValues(left, right, sorting) {
+    const missing = value => value == null || (typeof value === 'number' && !Number.isFinite(value));
+    for (const {column, direction} of sorting) {
+      const a = left[column], b = right[column];
+      if (missing(a) || missing(b)) {
+        if (missing(a) !== missing(b)) return missing(a) ? 1 : -1;
+        continue;
+      }
+      const compared = typeof a === 'string' ? a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'})
+        : Number(a) - Number(b);
+      if (compared) return direction === 'desc' ? -compared : compared;
+    }
+    return 0;
+  }
+
+  const tableHeaders = [...document.querySelectorAll('#unit-table thead th')];
+  const tableHeaderLabels = tableHeaders.map(header => header.textContent);
+  for (const [column, header] of tableHeaders.entries()) {
+    header.innerHTML = `<button type="button" class="sort-column">${esc(tableHeaderLabels[column])}<span class="sort-indicator" aria-hidden="true">↕</span></button>`;
+    header.addEventListener('click', () => {
+      tableSort = nextTableSort(tableSort, column);
+      applyTableSort();
+    });
+  }
+
+  function applyTableSort() {
+    const body = document.getElementById('unit-table-body');
+    const rows = [...unitRows.values()].sort((a, b) => compareTableValues(tableValues.get(a.dataset.nodeId), tableValues.get(b.dataset.nodeId), tableSort));
+    body.append(...rows);
+    for (const [column, header] of tableHeaders.entries()) {
+      const priority = tableSort.findIndex(sort => sort.column === column);
+      const sort = tableSort[priority];
+      header.removeAttribute('aria-sort');
+      if (priority === 0) header.setAttribute('aria-sort', sort.direction === 'asc' ? 'ascending' : 'descending');
+      header.querySelector('.sort-indicator').textContent = sort ? `${sort.direction === 'asc' ? '↑' : '↓'}${priority + 1}` : '↕';
+      header.querySelector('button').setAttribute('aria-label', sort
+        ? `${tableHeaderLabels[column]}, ${sort.direction === 'asc' ? 'ascending' : 'descending'}, priority ${priority + 1}. Activate to ${sort.direction === 'asc' ? 'sort descending' : 'remove from sorting'}.`
+        : `Add ${tableHeaderLabels[column]} to sorting, ascending`);
+      header.title = 'Click to cycle: ascending → descending → unsorted. Multiple columns sort in priority order.';
+    }
+    document.getElementById('table-sort-status').textContent = tableSort.length ? 'Sorted by ' + tableSort.map(sort =>
+      `${tableHeaderLabels[sort.column]} ${sort.direction === 'asc' ? 'ascending' : 'descending'}`).join(', then ') : '';
   }
 
   function setViewMode(mode) {
