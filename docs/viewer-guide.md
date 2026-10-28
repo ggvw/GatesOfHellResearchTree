@@ -66,6 +66,34 @@ Filters are grouped into General (CP, size, speed), Infantry (level and equipmen
 Weapons (calibre, capacity, rate, reload, turret turn speed, range, indirect fire), Armour, and Firepower
 estimates.
 
+Min and Max command points (CP) set inclusive limits on total unit CP, including
+crew. Leave either blank for no limit; unknown CP does not match an active limit.
+Min gun calibre (mm) increments in whole millimetres. Indirect fire offers Yes,
+No, or <unselected> (no restriction). Clear filters resets these controls too.
+
+The Infantry section also has Min soldier health, Min base vision (m), and
+Min equipped vision reach (est. m), with explanatory tooltips.
+A squad matches when at least one soldier meets all active health and vision
+limits. Vehicles do not match through their crews.
+Unknown stats and zero-count roster entries do not match an active limit.
+Each soldier's health, base vision, equipped vision reach, optics sources,
+and vision profile appear in Soldier stats.
+Health is maximum starting health, including breed health perks, not squad-total
+health. Base vision is the configured forward spotting distance against ordinary
+standing infantry in Conquest, not a universal detection limit. Target stance,
+stealth, cover and line of sight affect actual spotting. Peripheral vision,
+scopes, binoculars, and veterancy earned during battle are not included in base vision.
+
+Equipped vision reach is an estimate: the maximum of base vision and each usable
+carried scope/binocular's configured direct-control aim distance plus its aimed
+spotting radius. The soldier must have the matching ability and equipment tags.
+For example, a 130 m scoped rifle with a 15 m aimed radius estimates 145 m reach;
+200 m binocular aiming with a 30 m radius estimates 230 m. These are not passive
+all-round detection ranges or guaranteed in-game spotting distances: optics need
+active aiming and a clear line of sight. Without usable optics the value equals
+base vision. Missing required range data is Unknown, not silently ignored.
+All active health and vision limits must be met by the same soldier.
+
 The General section's Min speed (km/h) filter sets a minimum movement speed.
 Infantry uses the game's base sprint speed with breed perk modifiers; squads
 use their slowest member. Mounted units use their vehicle's road speed. Each

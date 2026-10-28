@@ -144,5 +144,6 @@ Run the viewer's armour filter checks with Node.js:
 
 ```bash
 node tests/test_armour_filters.js
+node tests/test_general_filters.js
 node tests/test_unit_table.js
 ```

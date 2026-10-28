@@ -456,7 +456,8 @@ def vehicle_speed(definition_text: str) -> float | None:
 
 def brace_section(text: str, name: str) -> str:
     """Read a balanced named section from a game definition."""
-    match = re.search(r'\{' + re.escape(name) + r'\b', text, re.IGNORECASE)
+    boundary = r'(?=\s|[{}])' if name.endswith('"') else r'\b'
+    match = re.search(r'\{' + re.escape(name) + boundary, text, re.IGNORECASE)
     if not match:
         return ""
     depth = 0
@@ -574,6 +575,168 @@ def expand_numeric_presets(text: str, templates: dict, active=frozenset()) -> st
         body = re.sub(r'%(\w+)', lambda item: arguments.get(item[1], item[0]), body)
         return expand_numeric_presets(body, templates, active | {name})
     return invocation.sub(replace, text)
+
+
+def infantry_vision_field(profile: str, vision_fields: str, presets: dict) -> tuple[str, float | None]:
+    """Expand a vision field and return its Conquest spotting radius."""
+    field = brace_section(vision_fields, f'"{profile}"') if profile else ''
+    field = active_definition_text(expand_numeric_presets(field, presets))
+    # Conquest is not multiplayer. Keep the non-MP radius override only.
+    for block in _named_parenthesized_blocks(field, '(mod ').values():
+        field = field.replace(block, '')
+    radius = re.search(r'\{radius\s+([^{}]+)\}', field, re.I)
+    return field, sdl_number(radius[1]) if radius else None
+
+
+def infantry_vitality(perks: str, human: str, vision_fields: str, presets: dict) -> dict:
+    """Resolve starting health and ordinary forward spotting, not scope range."""
+    perks = active_definition_text(expand_numeric_presets(perks, presets))
+    vitality = re.sub(r'\{extender\s+"vitality"', '{vitality', human, flags=re.I)
+    base_health = brace_section(brace_section(vitality, 'vitality'), 'Health')
+    maximum = re.search(r'\{max\s+([^}]+)\}', base_health, re.I)
+    health = sdl_number(maximum[1]) if maximum else None
+    modifiers = re.findall(r'\{\s*"?health"?\s+"?([^"}]+)"?\s*\}', perks, re.I)
+    if modifiers:
+        modifier = modifiers[-1].strip()
+        value = sdl_number(modifier.rstrip('%'))
+        if modifier.endswith('%'):
+            health = health * value / 100 if health is not None and value is not None else None
+        else:
+            health = value
+
+    eyes = brace_section(brace_section(human, 'Sensor'), 'Visor')
+    default_vision = re.search(r'\{vision\s+"?([^"\s}]+)', eyes, re.I)
+    visions = re.findall(r'\{\s*"?vision"?\s+"?([^"\s}]+)', perks, re.I)
+    profile = visions[-1] if visions else default_vision[1] if default_vision else None
+    field, scale = infantry_vision_field(profile, vision_fields, presets)
+    rules = brace_section(field, 'rules')
+    target = re.search(r'\{human\s+(\([^{}]*?\)|[^\s{}]+)', rules, re.I)
+    distance = sdl_number(target[1]) if target else None
+    vision_range = scale * distance if scale is not None and distance is not None else None
+    return {
+        'health': round(health, 2) if health is not None and health >= 0 else None,
+        'vision_profile': profile,
+        'vision_range_m': round(vision_range, 2) if vision_range is not None and vision_range >= 0 else None,
+    }
+
+
+def annotate_infantry_vitality(trees: list[dict], game_files: GameFiles) -> None:
+    """Read layered breed/perk/vision files, retaining unknown data as unknown."""
+    with open_archive(game_files.properties_archive) as properties, open_archive(game_files.game_logic_archive) as logic:
+        cache = {}
+
+        def text(archive, name, active=()):
+            if isinstance(archive, ArchiveView):
+                return archive.data.text(archive.prefix + name)
+            key = (id(archive), name)
+            if name in active or name not in archive.namelist():
+                return ''
+            if key not in cache:
+                raw = archive.read(name).decode('utf-8-sig', errors='replace')
+
+                def include(match):
+                    if match[1] is None:
+                        return ''  # Ignore commented-out settings and includes.
+                    child = match[1]
+                    if child.startswith('/'):
+                        child = child.lstrip('/')
+                    else:
+                        child = posixpath.normpath(posixpath.join(posixpath.dirname(name), child))
+                    return text(archive, child, (*active, name))
+
+                cache[key] = re.sub(r';[^\r\n]*|\(include\s+"([^"]+)"\s*\)', include, raw)
+            return cache[key]
+
+        human = active_definition_text(text(properties, 'properties/human.ext'))
+        vision_fields = text(logic, 'set/vision/vision.set')
+        presets = _named_parenthesized_blocks(vision_fields, '(define ')
+        # Standard presets also cover breeds with no explicit ability include.
+        for path in logic.namelist():
+            if path.startswith('set/breed/presets/perks/') and path.endswith('.inc'):
+                presets.update(_named_parenthesized_blocks(text(logic, path), '(define '))
+        equipment_files = {}
+        abilities = {}
+        for path in logic.namelist():
+            if path.startswith('set/stuff/') and not path.endswith('/'):
+                name = PurePosixPath(path).name
+                for suffix in ('.pattern', '.weapon'):
+                    name = name.removesuffix(suffix)
+                equipment_files[name.lower()] = path
+            if path.startswith('set/ability/') and path.endswith('.set'):
+                ability = active_definition_text(text(logic, path))
+                if not re.search(r'\bfrom\s+specialvision\b', ability):
+                    continue
+                profile = re.search(r'\{aimed_vision\s+"([^"]+)"', ability)
+                required = re.search(r'\{item\s+([^}]+)\}', ability)
+                if profile and required:
+                    _, radius = infantry_vision_field(profile[1], vision_fields, presets)
+                    abilities[PurePosixPath(path).stem] = {
+                        'tags': set(re.findall(r'"([^"]+)"', required[1])),
+                        'radius': radius,
+                    }
+
+        equipment_cache = {}
+
+        def equipment(reference, active=()):
+            """Inherit weapon tags/ranges so only usable, carried optics count."""
+            reference = reference.removeprefix('pattern ').lower()
+            if reference in active or reference not in equipment_files:
+                return {'tags': set(), 'ranges': {'default': {}, 'ammo': {}}}
+            if reference not in equipment_cache:
+                definition = active_definition_text(text(logic, equipment_files[reference]))
+                parent = re.search(r'\{from\s+"([^"]+)"', definition)
+                inherited = equipment(parent[1], (*active, reference)) if parent else {
+                    'tags': set(), 'ranges': {'default': {}, 'ammo': {}},
+                }
+                tags = set(inherited['tags'])
+                for block in re.findall(r'\{tag\s+"([^"]+)"', definition):
+                    for tag in block.split():
+                        if tag.startswith('-'):
+                            tags.discard(tag[1:])
+                        else:
+                            tags.add(tag)
+                equipment_cache[reference] = {
+                    'tags': tags,
+                    'ranges': weapon_range_settings(definition, presets, inherited['ranges']),
+                }
+            return equipment_cache[reference]
+
+        resolved = {}
+        enabled_abilities = {}
+        for tree in trees:
+            for node in tree['nodes']:
+                for member in node.get('members') or []:
+                    path = (member.get('breed_file') or {}).get('path')
+                    if path not in resolved:
+                        breed = text(logic, path) if path else ''
+                        local_presets = {**presets, **_named_parenthesized_blocks(breed, '(define ')}
+                        perks = brace_section(active_definition_text(breed), 'perks')
+                        expanded = active_definition_text(expand_numeric_presets(perks, local_presets))
+                        enabled_abilities[path] = [name for name in abilities if re.search(
+                            r'\{\s*"?' + re.escape(name) + r'"?\s*\}', expanded,
+                        )]
+                        resolved[path] = infantry_vitality(perks, human, vision_fields, local_presets) if breed else {
+                            'health': None, 'vision_profile': None, 'vision_range_m': None,
+                        }
+                    member.update(resolved[path])
+                    ranges = [member['vision_range_m']]
+                    sources = []
+                    for item in (member.get('breed_file') or {}).get('inventory_items', []):
+                        info = equipment(item['item'])
+                        for name in enabled_abilities.get(path, []):
+                            ability = abilities[name]
+                            if not ability['tags'] or not ability['tags'].issubset(info['tags']):
+                                continue
+                            aim = info['ranges']['default'].get('direct_control_range_m')
+                            radius = ability['radius']
+                            # Special vision is centred on the aimed point. This is
+                            # a reach estimate, not a passive detection guarantee.
+                            ranges.append(aim + radius if aim is not None and radius is not None else None)
+                            sources.append(item.get('display_name') or item['item'])
+                    member['equipped_vision_range_m'] = round(max(ranges), 2) if all(
+                        value is not None for value in ranges
+                    ) else None
+                    member['equipped_vision_sources'] = list(dict.fromkeys(sources))
 
 
 def weapon_range_settings(text: str, presets: dict, inherited: dict | None = None) -> dict:
@@ -1595,6 +1758,8 @@ def enrich_trees(trees: list[dict], game_files: GameFiles) -> None:
         node["unit_speed_kmh"] is not None for tree in trees for node in tree["nodes"]
     )
     log(f"Resolved unit movement speed for {unit_speed_count} research nodes")
+    annotate_infantry_vitality(trees, game_files)
+    log("Resolved soldier health and forward vision range from breed perks and vision definitions")
     annotate_firepower(trees)
     log("Calculated firepower estimates and comparison-group percentiles")
 
@@ -1877,12 +2042,16 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <h2 class="filter-heading">Highlight filters</h2>
   <details class="filter-group" id="general-filter" open>
     <summary>General</summary>
+    <label>Min command points (CP) <input id="min-cp" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max command points (CP) <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Min speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
   </details>
   <details class="filter-group" id="infantry-filter">
     <summary>Infantry</summary>
+    <label title="At least one soldier must meet the health and vision limits">Min soldier health <input id="min-infantry-health" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Ordinary forward spotting against standing infantry, without scopes or binoculars. One soldier must meet all active health and vision limits.">Min base vision (m) <input id="min-infantry-vision" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Estimated maximum of base vision and usable carried scope/binocular aim distance plus aimed spotting radius. Requires actively aiming the equipment; not passive all-round vision or guaranteed spotting. One soldier must meet all health and vision limits.">Min equipped vision reach (est. m) <input id="min-infantry-equipped-vision" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit level <input id="min-level" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min AT weapons <input id="min-infantry-at" type="number" min="0" step="1" placeholder="Any"></label>
     <details class="multi-filter" id="inventory-filter">
@@ -1904,12 +2073,16 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   </details>
   <details class="filter-group" id="weapons-filter">
     <summary>Weapons</summary>
-    <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="0.1" placeholder="Any"></label>
+    <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
     <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
     <label title="Minimum configured turn speed of the main turret; unknown speeds do not match">Min turret turn speed (°/s) <input id="min-turret-turn-speed" type="number" min="0" step="0.1" placeholder="Any"></label>
-    <label><span>Indirect fire</span><input id="has-indirect-fire" type="checkbox"></label>
+    <label><span>Indirect fire</span><select id="has-indirect-fire">
+      <option value="">&lt;unselected&gt;</option>
+      <option value="yes">Yes</option>
+      <option value="no">No</option>
+    </select></label>
     <details class="multi-filter" id="range-filter">
       <summary>Firing range</summary>
       <div class="firepower-controls">
@@ -2008,6 +2181,10 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   ];
   const maxReloadInput = document.getElementById('max-reload');
   const minTurretTurnSpeedInput = document.getElementById('min-turret-turn-speed');
+  const minCpInput = document.getElementById('min-cp');
+  const minInfantryHealthInput = document.getElementById('min-infantry-health');
+  const minInfantryVisionInput = document.getElementById('min-infantry-vision');
+  const minInfantryEquippedVisionInput = document.getElementById('min-infantry-equipped-vision');
   const maxCpInput = document.getElementById('max-cp');
   const hasIndirectFireInput = document.getElementById('has-indirect-fire');
   const inventoryOptions = document.getElementById('inventory-options');
@@ -2472,6 +2649,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   function applyFilters() {
     if (!tree || !nodeElements) return;
     const hasMinSize = minSizeInput.value !== '';
+    const hasMinHealth = minInfantryHealthInput.value !== '';
+    const hasMinVision = minInfantryVisionInput.value !== '';
+    const hasMinEquippedVision = minInfantryEquippedVisionInput.value !== '';
     const hasMinLevel = minLevelInput.value !== '';
     const hasMinInfantryAt = minInfantryAtInput.value !== '';
     const hasMinUnitSpeed = minUnitSpeedInput.value !== '';
@@ -2481,15 +2661,16 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const hasMinCaliber = minCaliberInput.value !== '';
     const hasMaxReload = maxReloadInput.value !== '';
     const hasMinTurretTurnSpeed = minTurretTurnSpeedInput.value !== '';
+    const hasMinCp = minCpInput.value !== '';
     const hasMaxCp = maxCpInput.value !== '';
     const firepowerFilters = [...firepowerControls].filter(([, input]) => input.value !== '');
     const rangeFilters = gunRangeControls.filter(control => control.input.value !== '');
-    const indirectFireOnly = hasIndirectFireInput.checked;
+    const indirectFire = hasIndirectFireInput.value;
     const selectedInventory = selectedValues(inventoryOptions);
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMaxCp || indirectFireOnly || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
+    const active = hasMinSize || hasMinHealth || hasMinVision || hasMinEquippedVision || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMinCp || hasMaxCp || indirectFire !== '' || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
@@ -2499,6 +2680,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const minCaliber = Number(minCaliberInput.value);
     const maxReload = Number(maxReloadInput.value);
     const minTurretTurnSpeed = Number(minTurretTurnSpeedInput.value);
+    const minCp = Number(minCpInput.value);
     const maxCp = Number(maxCpInput.value);
     const matchingIds = new Set();
     const query = document.getElementById('search').value.trim().toLowerCase();
@@ -2515,6 +2697,12 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const reload = viewMode === 'table' ? gun?.reload_time_seconds : node.reload_time;
       const commandPoints = node.unit?.cp;
       const match = active
+        && (!(hasMinHealth || hasMinVision || hasMinEquippedVision) || (node.unit_class === 'infantry' && (node.members || []).some(member =>
+          member.count > 0
+          && (!hasMinHealth || (Number.isFinite(member.health) && member.health >= Number(minInfantryHealthInput.value)))
+          && (!hasMinVision || (Number.isFinite(member.vision_range_m) && member.vision_range_m >= Number(minInfantryVisionInput.value)))
+          && (!hasMinEquippedVision || (Number.isFinite(member.equipped_vision_range_m) && member.equipped_vision_range_m >= Number(minInfantryEquippedVisionInput.value)))
+        )))
         && (!hasMinSize || (unitSize !== null && unitSize !== undefined && unitSize >= minSize))
         && (!hasMinLevel || (unitLevel !== null && unitLevel !== undefined && unitLevel >= minLevel))
         && (!hasMinInfantryAt || (node.unit_class === 'infantry' && infantryAt >= minInfantryAt))
@@ -2525,6 +2713,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         && (!hasMinCaliber || (caliber !== null && caliber !== undefined && caliber >= minCaliber))
         && (!hasMaxReload || (reload !== null && reload !== undefined && reload <= maxReload))
         && (!hasMinTurretTurnSpeed || (Number.isFinite(node.turret_turn_speed_deg_s) && node.turret_turn_speed_deg_s >= minTurretTurnSpeed))
+        && (!hasMinCp || (commandPoints !== null && commandPoints !== undefined && commandPoints >= minCp))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
         && rangeFilters.every(({field, input, minimum}) => Number.isFinite(gun?.[field])
           && (minimum ? gun[field] >= Number(input.value) : gun[field] <= Number(input.value)))
@@ -2533,7 +2722,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
           const value = node.firepower?.[slot]?.[metric];
           return value !== null && value !== undefined && value >= Number(input.value);
         })
-        && (!indirectFireOnly || node.indirect_fire)
+        && (indirectFire === '' || node.indirect_fire === (indirectFire === 'yes'))
         && (!selectedInventory.size || (node.inventory_types || []).some(type => selectedInventory.has(type)))
         && (!selectedWeaponRoles.size || (node.weapon_roles || []).some(role => selectedWeaponRoles.has(role)))
         && (!selectedInfantryWeapons.size || (node.infantry_weapons || []).some(weapon => selectedInfantryWeapons.has(weapon)))
@@ -2689,7 +2878,14 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         }))},
         {title: 'Soldier stats', values: members.map(member => {
           const {raw, alias, ...stats} = member.declaration || {};
-          return stats;
+          return {
+            health: member.health ?? 'Unknown',
+            base_vision_range_m: member.vision_range_m ?? 'Unknown',
+            equipped_vision_reach_estimate_m: member.equipped_vision_range_m ?? 'Unknown',
+            equipped_vision_sources: member.equipped_vision_sources,
+            vision_profile: member.vision_profile,
+            ...stats,
+          };
         })},
         {title: 'Breed and abilities', values: members.map(member => {
           const {inventory_items, ...stats} = member.breed_file || {};
@@ -2697,7 +2893,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         })},
       ];
       const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
-      return statSection(`${group} (${count})`, comparisonTable(
+      const description = '<p class="muted">Health is maximum starting health per soldier. Base vision is ordinary forward spotting against standing infantry. Equipped vision reach estimates the maximum of base vision and usable carried scope/binocular aim distance plus aimed spotting radius. Optics require active aiming, not passive all-round vision. Cover, stealth and line of sight affect spotting.</p>';
+      return statSection(`${group} (${count})`, description + comparisonTable(
         members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections
       ));
     }).join('');
@@ -2926,7 +3123,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       else resizeStatsPanel(statsWidth);
     }, 210);
   });
-  const filterControls = [minSizeInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
+  const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
@@ -2938,7 +3135,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   document.getElementById('clear-filters').addEventListener('click', () => {
     for (const input of filterControls) if (input.type === 'number') input.value = '';
     armourPartInput.value = 'main';
-    hasIndirectFireInput.checked = false;
+    hasIndirectFireInput.value = '';
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
     updateFilterSummaries(); applyFilters(); fitTree();
   });
