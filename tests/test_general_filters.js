@@ -7,10 +7,10 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '..', 'create_research_tree_html.py'), 'utf8');
 const code = source.slice(source.indexOf('  function applyFilters()'), source.indexOf('  function prerequisiteSet('));
 const nodes = [
-  {id: 'zero', unit: {cp: 0}, indirect_fire: false},
-  {id: 'direct', unit: {cp: 2}, indirect_fire: false},
-  {id: 'indirect', unit: {cp: 7}, indirect_fire: true},
-  {id: 'unknown', unit: {cp: null}},
+  {id: 'zero', cost: 0, requires: [], unit: {cp: 0}, indirect_fire: false},
+  {id: 'direct', cost: 2, requires: ['tech'], unit: {cp: 2}, indirect_fire: false},
+  {id: 'indirect', cost: 4, requires: ['direct', 'tech'], unit: {cp: 7}, indirect_fire: true},
+  {id: 'unknown', cost: 1, requires: [], unit: {cp: null}},
 ];
 const highlighted = new Set();
 const elements = new Map();
@@ -37,6 +37,10 @@ const context = {
 for (const name of code.matchAll(/\b(\w+Input)\.value/g)) context[name[1]] = {value: ''};
 vm.createContext(context);
 vm.runInContext(code, context);
+const totalCode = source.slice(source.indexOf('  function totalResearchPoints('), source.indexOf('  function renderUnitTable('));
+const prerequisiteCode = source.slice(source.indexOf('  function prerequisiteSet('), source.indexOf('  function selectNode('));
+vm.runInContext(totalCode + prerequisiteCode, context);
+context.byId.set('tech', {id: 'tech', cost: 3, requires: []});
 
 for (const mode of ['graph', 'table']) {
   context.viewMode = mode;
@@ -61,6 +65,32 @@ for (const mode of ['graph', 'table']) {
     assert.deepEqual([...highlighted], active ? expected : []);
   }
 }
+
+for (const mode of ['graph', 'table']) {
+  context.viewMode = mode;
+  context.minCpInput.value = '';
+  context.maxCpInput.value = '';
+  context.hasIndirectFireInput.value = '';
+  for (const [limit, expected] of [
+    ['0', ['zero']],
+    ['4', ['zero', 'unknown']],
+    ['5', ['zero', 'direct', 'unknown']],
+    ['8', ['zero', 'direct', 'unknown']],
+    ['9', ['zero', 'direct', 'indirect', 'unknown']],
+    ['', ['zero', 'direct', 'indirect', 'unknown']],
+  ]) {
+    context.maxTotalRpInput.value = limit;
+    context.applyFilters();
+    assert.deepEqual([...context.unitRows].filter(([, row]) => !row.hidden).map(([id]) => id), expected);
+    assert.deepEqual([...highlighted].sort(), limit === '' ? [] : [...expected].sort());
+  }
+  context.maxTotalRpInput.value = '5';
+  context.minCpInput.value = '2';
+  context.applyFilters();
+  assert.deepEqual([...context.unitRows].filter(([, row]) => !row.hidden).map(([id]) => id), ['direct']);
+}
+context.maxTotalRpInput.value = '';
+assert.match(source, /const filterControls = \[[^\n]*maxTotalRpInput/);
 
 assert.match(source, /id="min-caliber"[^>]*step="1"/);
 assert.match(source, /const filterControls = \[[^\n]*minCpInput/);

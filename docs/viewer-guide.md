@@ -68,6 +68,10 @@ estimates.
 
 Min and Max command points (CP) set inclusive limits on total unit CP, including
 crew. Leave either blank for no limit; unknown CP does not match an active limit.
+Max total RP limits the unit's own RP plus all prerequisites, counting shared
+prerequisites once. It uses the same total as the table and statistics panel.
+The limit is inclusive; leave it blank for no limit. It works in both views and
+is reset by Clear filters.
 Min gun calibre (mm) increments in whole millimetres. Indirect fire offers Yes,
 No, or <unselected> (no restriction). Clear filters resets these controls too.
 

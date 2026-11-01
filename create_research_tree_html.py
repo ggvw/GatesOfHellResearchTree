@@ -2044,6 +2044,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     <summary>General</summary>
     <label>Min command points (CP) <input id="min-cp" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max command points (CP) <input id="max-cp" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Unit RP plus all prerequisites, counting shared prerequisites once">Max total RP <input id="max-total-rp" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Min unit size <input id="min-size" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum maximum movement speed: infantry sprint or vehicle road speed">Min speed (km/h) <input id="min-unit-speed" type="number" min="0" step="1" placeholder="Any"></label>
   </details>
@@ -2186,6 +2187,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   const minInfantryVisionInput = document.getElementById('min-infantry-vision');
   const minInfantryEquippedVisionInput = document.getElementById('min-infantry-equipped-vision');
   const maxCpInput = document.getElementById('max-cp');
+  const maxTotalRpInput = document.getElementById('max-total-rp');
   const hasIndirectFireInput = document.getElementById('has-indirect-fire');
   const inventoryOptions = document.getElementById('inventory-options');
   const inventorySummary = document.getElementById('inventory-summary');
@@ -2663,6 +2665,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const hasMinTurretTurnSpeed = minTurretTurnSpeedInput.value !== '';
     const hasMinCp = minCpInput.value !== '';
     const hasMaxCp = maxCpInput.value !== '';
+    const hasMaxTotalRp = maxTotalRpInput.value !== '';
     const firepowerFilters = [...firepowerControls].filter(([, input]) => input.value !== '');
     const rangeFilters = gunRangeControls.filter(control => control.input.value !== '');
     const indirectFire = hasIndirectFireInput.value;
@@ -2670,7 +2673,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinHealth || hasMinVision || hasMinEquippedVision || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMinCp || hasMaxCp || indirectFire !== '' || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
+    const active = hasMinSize || hasMinHealth || hasMinVision || hasMinEquippedVision || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMinCp || hasMaxCp || hasMaxTotalRp || indirectFire !== '' || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
@@ -2682,6 +2685,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const minTurretTurnSpeed = Number(minTurretTurnSpeedInput.value);
     const minCp = Number(minCpInput.value);
     const maxCp = Number(maxCpInput.value);
+    const maxTotalRp = Number(maxTotalRpInput.value);
     const matchingIds = new Set();
     const query = document.getElementById('search').value.trim().toLowerCase();
     for (const [id, element] of nodeElements) {
@@ -2715,6 +2719,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         && (!hasMinTurretTurnSpeed || (Number.isFinite(node.turret_turn_speed_deg_s) && node.turret_turn_speed_deg_s >= minTurretTurnSpeed))
         && (!hasMinCp || (commandPoints !== null && commandPoints !== undefined && commandPoints >= minCp))
         && (!hasMaxCp || (commandPoints !== null && commandPoints !== undefined && commandPoints <= maxCp))
+        && (!hasMaxTotalRp || totalResearchPoints(node) <= maxTotalRp)
         && rangeFilters.every(({field, input, minimum}) => Number.isFinite(gun?.[field])
           && (minimum ? gun[field] >= Number(input.value) : gun[field] <= Number(input.value)))
         && firepowerFilters.every(([key, input]) => {
@@ -3123,7 +3128,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       else resizeStatsPanel(statsWidth);
     }, 210);
   });
-  const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
+  const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, maxTotalRpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();
