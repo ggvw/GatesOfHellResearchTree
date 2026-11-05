@@ -739,6 +739,93 @@ def annotate_infantry_vitality(trees: list[dict], game_files: GameFiles) -> None
                     member['equipped_vision_sources'] = list(dict.fromkeys(sources))
 
 
+def weapon_penetration_settings(text: str, presets: dict, inherited: dict | None = None) -> dict:
+    """Extract nominal armour penetration curves, keeping shell overrides separate."""
+    inherited = inherited or {'default': None, 'ammo': {}}
+    result = {'default': inherited['default'], 'ammo': dict(inherited['ammo'])}
+
+    def positional_calls(value):
+        # Older small-arms presets use args/%0 rather than named arguments.
+        value = re.sub(r'%(\d+)', r'%arg\1', value)
+        return re.sub(r'\("([^"\n]+)"\s+args\s+([^()\r\n]+)\)', lambda match:
+                      '("' + match[1] + '" ' + ' '.join(
+                          f'arg{index}({argument})' for index, argument in enumerate(match[2].split())
+                      ) + ')', value)
+
+    templates = {name: positional_calls(body) for name, body in presets.items()}
+    text = expand_numeric_presets(positional_calls(active_definition_text(text)), templates)
+    for _ in range(64):
+        def fold(match):
+            value = sdl_number(match[0])
+            return str(value) if value is not None else match[0]
+        expanded = re.sub(r'\([+*/-]\s+[^()]+\)', fold, text)
+        if expanded == text:
+            break
+        text = expanded
+
+    def walk(value, ammunition=None):
+        position = 0
+        while match := re.search(r'[({]', value[position:]):
+            start = position + match.start()
+            opening = value[start]
+            closing = ')' if opening == '(' else '}'
+            depth, end = 0, None
+            for token in re.finditer(r'"(?:\\.|[^"\\])*"|[{}()]', value[start:]):
+                if token[0] == opening:
+                    depth += 1
+                elif token[0] == closing:
+                    depth -= 1
+                    if depth == 0:
+                        end = start + token.end()
+                        break
+            if end is None:
+                return
+            block, position = value[start:end], end
+            if opening == '(':
+                continue  # Ignore inactive modes and unexpanded calls.
+            key = re.match(r'\{\s*([a-z_]+)\b', block, re.I)
+            if not key:
+                continue
+            body = block[key.end():-1].strip()
+            name = key[1].lower()
+            if name == 'parameters':
+                shell = re.match(r'"([^"]+)"', body)
+                if shell:
+                    walk(body[shell.end():], shell[1].lower())
+            elif name in {'from', 'weapon', 'weapon_bullet', 'weapon_throw'}:
+                walk(body, ammunition)
+            elif name == 'projectiledamagetable':
+                points = {}
+                for row in re.findall(r'\{([^{}]+)\}', body):
+                    pair = row.split()
+                    if len(pair) < 2:
+                        continue
+                    distance = sdl_number(pair[0])
+                    penetration = sdl_number(' '.join(pair[1:]))
+                    if distance is not None and distance >= 0:
+                        points[distance] = penetration if penetration is not None and penetration >= 0 else None
+                curve = sorted(points.items())
+                if ammunition is None:
+                    result['default'] = curve
+                else:
+                    result['ammo'][ammunition] = curve
+    walk(text)
+    return result
+
+
+def penetration_at_distance(curve: list, distance: float) -> float | None:
+    """Read exact points or interpolate between them; never extrapolate."""
+    for position, value in curve or []:
+        if position == distance:
+            return round(value, 2) if value is not None else None
+    for (start, first), (end, last) in zip(curve or [], (curve or [])[1:]):
+        if start < distance < end:
+            if first is None or last is None:
+                return None
+            return round(first + (last - first) * (distance - start) / (end - start), 2)
+    return None
+
+
 def weapon_range_settings(text: str, presets: dict, inherited: dict | None = None) -> dict:
     """Keep base weapon ranges separate from ammunition-specific overrides."""
     inherited = inherited or {'default': {}, 'ammo': {}}
@@ -1202,11 +1289,14 @@ def annotate_unit_metadata(
                 anti_personnel_grenades.add(basename.lower())
 
         preset_blocks: dict[str, str] = {}
+        scoped_presets = {}
         for name in gamelogic.namelist():
             if name.startswith("set/stuff/") and name.endswith("/.presets"):
                 preset_text = gamelogic.read(name).decode("utf-8", errors="replace")
                 preset_text = re.sub(r";[^\r\n]*", "", preset_text)
-                preset_blocks.update(_named_parenthesized_blocks(preset_text, '(define '))
+                definitions_in_file = _named_parenthesized_blocks(preset_text, '(define ')
+                preset_blocks.update(definitions_in_file)
+                scoped_presets[str(PurePosixPath(name).parent)] = definitions_in_file
 
         reload_pattern = re.compile(r'\("reload time"\s+seconds\(([0-9.]+)\)\)', re.IGNORECASE)
 
@@ -1451,6 +1541,52 @@ def annotate_unit_metadata(
                 for name, values in settings['ammo'].items()
             ]}
 
+        penetration_cache = {}
+
+        def inherited_penetration(reference, active=frozenset()):
+            reference = re.sub(r'^weapon\s+', '', reference.strip(), flags=re.I).lower()
+            if reference in penetration_cache:
+                return penetration_cache[reference]
+            empty = {'default': None, 'ammo': {}}
+            if reference in active or len(active) >= 64:
+                return empty
+            for path in weapon_files.get(reference, []):
+                raw = gamelogic.read(path).decode(errors='replace')
+                if isinstance(gamelogic, ArchiveView):
+                    raw = gamelogic.data.text(gamelogic.prefix + path)
+                raw = re.sub(r';[^\r\n]*', '', raw)
+                parent = re.search(r'\{from\s+"([^"]+)"', raw, re.I)
+                inherited = empty
+                if parent:
+                    identifier = parent[1]
+                    if identifier.startswith('pattern '):
+                        identifier = identifier.removeprefix('pattern ') + '.pattern'
+                    inherited = inherited_penetration(identifier, active | {reference})
+                # Identically named macros differ between gun/rifle/MG folders.
+                presets = {}
+                for folder in reversed(PurePosixPath(path).parents):
+                    presets.update(scoped_presets.get(str(folder), {}))
+                presets.update(_named_parenthesized_blocks(raw, '(define '))
+                result = weapon_penetration_settings(raw, presets, inherited)
+                penetration_cache[reference] = result
+                return result
+            return empty
+
+        def weapon_penetration_stats(reference, ammunition=None):
+            settings = inherited_penetration(reference)
+            curves = dict(settings['ammo'])
+            if settings['default'] is not None:
+                curves = {'default': settings['default'], **curves}
+            carried = {ammo['id'].split()[-1] for ammo in ammunition or [] if ammo.get('total_count', 0) > 0}
+            # An ammo-specific curve replaces the default for that shell.
+            default_carried = bool(carried - settings['ammo'].keys())
+            return [{
+                'ammunition': shell,
+                'penetration_10m_mm': penetration_at_distance(curve, 10),
+                'penetration_100m_mm': penetration_at_distance(curve, 100),
+                'carried': (default_carried if shell == 'default' else shell in carried) if ammunition else None,
+            } for shell, curve in curves.items()]
+
         for tree in trees:
             for node in tree["nodes"]:
                 unit = node.get("unit") or {}
@@ -1458,6 +1594,7 @@ def annotate_unit_metadata(
                     annotate_member_weapons(member, handheld_weapon_categories)
                     for weapon in member["weapons"]:
                         weapon.update(weapon_range_stats(weapon["id"]))
+                        weapon['armor_penetration'] = weapon_penetration_stats(weapon['id'])
                         weapon["indirect_fire"] = weapon_indirect_fire(weapon["id"])
                         weapon["rounds_before_reload"] = weapon_filling(weapon["id"])[1]
                         weapon["rate_of_fire_rpm"] = weapon_fire_rate(weapon["id"])
@@ -1535,6 +1672,7 @@ def annotate_unit_metadata(
                         "ammunition": vehicle_ammunition(weapon_text, reference),
                     })
                 for weapon in node["vehicle_weapons"]:
+                    weapon['armor_penetration'] = weapon_penetration_stats(weapon['id'], weapon['ammunition'])
                     for ammo in weapon["ammunition"]:
                         ammo["shared_reserve"] = ammo["spare_count"] > 0 and sum(
                             any(other_ammo["id"] == ammo["id"] for other_ammo in other["ammunition"])
@@ -2075,6 +2213,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <details class="filter-group" id="weapons-filter">
     <summary>Weapons</summary>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Nominal penetration of the largest-calibre gun. Both penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Not a guarantee against sloped armour.">Min penetration at 10 m (mm) <input id="min-penetration-10m" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Nominal penetration of the largest-calibre gun. Both penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Unknown penetration does not match.">Min penetration at 100 m (mm) <input id="min-penetration-100m" type="number" min="0" step="1" placeholder="Any"></label>
     <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
     <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
@@ -2175,6 +2315,10 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     armourControls.set(face, control.querySelector('input'));
   }
   const minCaliberInput = document.getElementById('min-caliber');
+  const penetrationControls = [
+    {field: 'penetration_10m_mm', input: document.getElementById('min-penetration-10m')},
+    {field: 'penetration_100m_mm', input: document.getElementById('min-penetration-100m')},
+  ];
   const gunRangeControls = [
     {field: 'ai_range_m', input: document.getElementById('min-ai-range'), minimum: true},
     {field: 'direct_control_range_m', input: document.getElementById('min-direct-control-range'), minimum: true},
@@ -2648,6 +2792,12 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     });
   }
 
+  function matchesPenetration(node, filters) {
+    if (!filters.length) return true;
+    return (largestGun(node)?.armor_penetration || []).some(shell => shell.carried !== false
+      && filters.every(({field, input}) => Number.isFinite(shell[field]) && shell[field] >= Number(input.value)));
+  }
+
   function applyFilters() {
     if (!tree || !nodeElements) return;
     const hasMinSize = minSizeInput.value !== '';
@@ -2668,12 +2818,13 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const hasMaxTotalRp = maxTotalRpInput.value !== '';
     const firepowerFilters = [...firepowerControls].filter(([, input]) => input.value !== '');
     const rangeFilters = gunRangeControls.filter(control => control.input.value !== '');
+    const penetrationFilters = penetrationControls.filter(control => control.input.value !== '');
     const indirectFire = hasIndirectFireInput.value;
     const selectedInventory = selectedValues(inventoryOptions);
     const selectedWeaponRoles = selectedValues(weaponRoleOptions);
     const selectedInfantryWeapons = selectedValues(infantryWeaponOptions);
     const selectedSpecialists = selectedValues(specialistOptions);
-    const active = hasMinSize || hasMinHealth || hasMinVision || hasMinEquippedVision || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMinCp || hasMaxCp || hasMaxTotalRp || indirectFire !== '' || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length;
+    const active = hasMinSize || hasMinHealth || hasMinVision || hasMinEquippedVision || hasMinLevel || hasMinInfantryAt || hasMinUnitSpeed || hasMinRounds || hasMinRate || armourFilters.length || hasMinCaliber || hasMaxReload || hasMinTurretTurnSpeed || hasMinCp || hasMaxCp || hasMaxTotalRp || indirectFire !== '' || selectedInventory.size || selectedWeaponRoles.size || selectedInfantryWeapons.size || selectedSpecialists.size || firepowerFilters.length || rangeFilters.length || penetrationFilters.length;
     const minSize = Number(minSizeInput.value);
     const minLevel = Number(minLevelInput.value);
     const minInfantryAt = Number(minInfantryAtInput.value);
@@ -2701,6 +2852,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const reload = viewMode === 'table' ? gun?.reload_time_seconds : node.reload_time;
       const commandPoints = node.unit?.cp;
       const match = active
+        && matchesPenetration(node, penetrationFilters)
         && (!(hasMinHealth || hasMinVision || hasMinEquippedVision) || (node.unit_class === 'infantry' && (node.members || []).some(member =>
           member.count > 0
           && (!hasMinHealth || (Number.isFinite(member.health) && member.health >= Number(minInfantryHealthInput.value)))
@@ -2905,6 +3057,15 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     }).join('');
   }
 
+  function penetrationStat(weapon, field) {
+    if (!weapon.armor_penetration?.length) return 'Unknown';
+    return weapon.armor_penetration.map(shell => {
+      const name = shell.ammunition === 'default' ? 'Default' : shell.ammunition.toUpperCase();
+      const value = Number.isFinite(shell[field]) ? `${number(shell[field])} mm` : 'Unknown';
+      return `${name}: ${value}${shell.carried === false ? ' (not carried)' : ''}`;
+    });
+  }
+
   function weaponStats(node, hasVehicle) {
     const weapons = (node.vehicle_weapons || []).map(weapon => ({...weapon}));
     const carried = new Map();
@@ -2926,6 +3087,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         carried_count: weapon.count,
         carried_by: weapon.carriers ? [...weapon.carriers] : null,
         caliber_mm: weapon.caliber_mm ?? 'Unknown',
+        armour_penetration_at_10_m: penetrationStat(weapon, 'penetration_10m_mm'),
+        armour_penetration_at_100_m: penetrationStat(weapon, 'penetration_100m_mm'),
         indirect_fire_capability: weapon.indirect_fire ? 'Yes' : 'No',
         reload_time_seconds: weapon.reload_time_seconds ?? 'Unknown',
         rounds_before_reload: weapon.rounds_before_reload ?? 'Unknown',
@@ -2940,7 +3103,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
           ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
           : weapon.mount_count != null ? 'Unknown' : null,
       }))}], 'Weapon comparison'
-    ));
+    ) + '<p class="muted">Penetration is nominal thickness in mm from each shell’s configured projectile-damage curve. Intermediate distances use linear interpolation; values outside the listed curve are Unknown. Angle, armour material and slope modifiers affect actual penetration. Filters use the largest-calibre gun and the same shell for both limits; known uncarried types do not qualify. Where ammo is unknown, configured types are used.</p>');
   }
 
   function armorStats(node, hasVehicle) {
@@ -3128,7 +3291,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       else resizeStatsPanel(statsWidth);
     }, 210);
   });
-  const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, maxTotalRpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input)];
+  const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, maxTotalRpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input), ...penetrationControls.map(control => control.input)];
   for (const control of filterControls) control.addEventListener('input', () => {
     applyFilters();
     if (selectedBranchTypes().size) fitTree();

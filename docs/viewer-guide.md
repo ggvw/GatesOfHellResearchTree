@@ -105,6 +105,25 @@ soldier's sprint speed is also shown in the comparison table. These are configur
 speeds; terrain, stamina, injuries, and carried equipment can affect actual
 movement. Unresolved speeds are shown as Unknown and do not match this filter.
 
+### Armour penetration
+
+Weapon stats show nominal penetration in millimetres at 10 m and 100 m for each
+configured shell type, including ammunition-specific overrides inherited from
+the gun definition. These are the game's projectile penetration curves, not
+health damage or the Firepower calibre-weighted index. Exact table points are
+used where available; intermediate distances use linear interpolation. Values
+outside the curve and unresolved values remain Unknown rather than becoming zero.
+Actual penetration also depends on impact angle, armour material and slope modifiers.
+
+The Weapons section has minimum penetration filters for both distances. They
+use the largest-calibre weapon in both graph and table modes, and the same shell
+must satisfy both limits. When the gun's carried ammunition is known, uncarried
+shell types are labelled in the stats and excluded from filtering. If ammunition
+is unresolved, filtering uses configured types without guaranteeing availability.
+Unknown values do not match an active minimum; Clear filters resets both limits.
+
+### Other weapon and armour filters
+
 Min rounds before reload checks the primary vehicle gun, or any soldier's main
 weapon in an infantry squad. Secondary and additional weapons do not affect
 matching. This is weapon capacity, separate from starting loaded rounds and
