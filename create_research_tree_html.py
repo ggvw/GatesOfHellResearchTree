@@ -1574,18 +1574,28 @@ def annotate_unit_metadata(
 
         def weapon_penetration_stats(reference, ammunition=None):
             settings = inherited_penetration(reference)
+            ranges = inherited_weapon_ranges(reference)
             curves = dict(settings['ammo'])
             if settings['default'] is not None:
                 curves = {'default': settings['default'], **curves}
+                for shell in ranges['ammo']:
+                    curves.setdefault(shell, settings['default'])
             carried = {ammo['id'].split()[-1] for ammo in ammunition or [] if ammo.get('total_count', 0) > 0}
             # An ammo-specific curve replaces the default for that shell.
-            default_carried = bool(carried - settings['ammo'].keys())
-            return [{
-                'ammunition': shell,
-                'penetration_10m_mm': penetration_at_distance(curve, 10),
-                'penetration_100m_mm': penetration_at_distance(curve, 100),
-                'carried': (default_carried if shell == 'default' else shell in carried) if ammunition else None,
-            } for shell, curve in curves.items()]
+            default_carried = bool(carried - curves.keys())
+            result = []
+            for shell, curve in curves.items():
+                shell_ranges = {**ranges['default'], **ranges['ammo'].get(shell, {})}
+                maximum = shell_ranges.get('direct_control_range_m')
+                result.append({
+                    'ammunition': shell,
+                    'penetration_10m_mm': penetration_at_distance(curve, 10),
+                    'penetration_100m_mm': penetration_at_distance(curve, 100),
+                    'maximum_range_m': maximum,
+                    'penetration_max_range_mm': penetration_at_distance(curve, maximum) if maximum is not None else None,
+                    'carried': (default_carried if shell == 'default' else shell in carried) if ammunition else None,
+                })
+            return result
 
         for tree in trees:
             for node in tree["nodes"]:
@@ -2213,8 +2223,13 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <details class="filter-group" id="weapons-filter">
     <summary>Weapons</summary>
     <label>Min gun calibre (mm) <input id="min-caliber" type="number" min="0" step="1" placeholder="Any"></label>
-    <label title="Nominal penetration of the largest-calibre gun. Both penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Not a guarantee against sloped armour.">Min penetration at 10 m (mm) <input id="min-penetration-10m" type="number" min="0" step="1" placeholder="Any"></label>
-    <label title="Nominal penetration of the largest-calibre gun. Both penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Unknown penetration does not match.">Min penetration at 100 m (mm) <input id="min-penetration-100m" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Nominal penetration of the largest-calibre gun. All penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Not a guarantee against sloped armour.">Min penetration at 10 m (mm) <input id="min-penetration-10m" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Nominal penetration of the largest-calibre gun. All penetration limits must match the same shell type. Only carried types qualify when ammunition is known; otherwise configured types are used. Unknown penetration does not match.">Min penetration at 100 m (mm) <input id="min-penetration-100m" type="number" min="0" step="1" placeholder="Any"></label>
+    <label title="Penetration at each shell’s configured maximum direct-control range, including ammo-specific overrides. All penetration limits must match the same shell type.">Min penetration at max range (mm) <input id="min-penetration-max-range" type="number" min="0" step="1" placeholder="Any"></label>
+    <details class="metric-help" id="penetration-filter-help">
+      <summary>Penetration filter help</summary>
+      <p>Filters use the largest-calibre gun. The same shell must satisfy all penetration limits. Known uncarried shells do not qualify; if ammo is unresolved, configured shell types are used. Max range is each shell’s configured direct-control limit, not the final zero-penetration point of its curve. Unknown values do not match. Actual results depend on armour angle and material.</p>
+    </details>
     <label title="Minimum capacity of the primary weapon; infantry matches any soldier's main weapon">Min rounds before reload <input id="min-rounds-before-reload" type="number" min="1" step="1" placeholder="Any"></label>
     <label title="Minimum primary-weapon rate of fire; infantry matches any soldier's main weapon">Min rate of fire (RPM) <input id="min-rate-of-fire" type="number" min="0" step="1" placeholder="Any"></label>
     <label>Max reload (s) <input id="max-reload" type="number" min="0" step="0.1" placeholder="Any"></label>
@@ -2231,7 +2246,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         <label>Min direct-control range (m) <input id="min-direct-control-range" type="number" min="0" step="1" placeholder="Any"></label>
         <label>Max minimum firing distance (m) <input id="max-minimum-firing-range" type="number" min="0" step="1" placeholder="Any"></label>
       </div>
-      <p class="muted metric-help">Configured ranges of the largest-calibre weapon. Filters use its default ammunition settings; ammunition overrides are listed in Weapon stats. Direct-control limits can vary by game mode. Unknown values do not match.</p>
+      <details class="metric-help" id="range-filter-help"><summary>Firing range help</summary>
+        <p>Configured ranges of the largest-calibre weapon. Filters use its default ammunition settings; ammunition overrides are listed in Weapon stats. Direct-control limits can vary by game mode. Unknown values do not match.</p>
+      </details>
     </details>
   </details>
   <details class="filter-group" id="armour-filter">
@@ -2243,7 +2260,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       <option value="any">Any part</option>
     </select></label>
     <div id="armour-controls"></div>
-    <p class="muted metric-help">Thickness in mm. A single part must meet every minimum. Faces without an override use that part’s default. Unknown values do not match.</p>
+    <details class="metric-help" id="armour-filter-help"><summary>Armour filter help</summary>
+      <p>Thickness in mm. A single part must meet every minimum. Faces without an override use that part’s default. Unknown values do not match.</p>
+    </details>
   </details>
   <details class="filter-group" id="firepower-filter">
     <summary>Firepower estimates</summary>
@@ -2310,7 +2329,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     ['rear', 'rear'], ['top', 'roof'], ['bottom', 'floor'], ['default', 'default'],
   ]) {
     const control = document.createElement('label');
-    control.innerHTML = `Min ${name} (mm) <input id="min-${face}-armor" type="number" min="0" step="0.1" placeholder="Any">`;
+    control.innerHTML = `Min ${name} (mm) <input id="min-${face}-armor" type="number" min="0" step="1" placeholder="Any">`;
     document.getElementById('armour-controls').append(control);
     armourControls.set(face, control.querySelector('input'));
   }
@@ -2318,6 +2337,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   const penetrationControls = [
     {field: 'penetration_10m_mm', input: document.getElementById('min-penetration-10m')},
     {field: 'penetration_100m_mm', input: document.getElementById('min-penetration-100m')},
+    {field: 'penetration_max_range_mm', input: document.getElementById('min-penetration-max-range')},
   ];
   const gunRangeControls = [
     {field: 'ai_range_m', input: document.getElementById('min-ai-range'), minimum: true},
@@ -3016,6 +3036,10 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     return `<details class="stat-section" data-state-key="${esc(key)}"${expanded ? ' open' : ''}><summary>${esc(title)}</summary>${content}</details>`;
   }
 
+  function statHelp(key, content) {
+    return `<details class="metric-help" data-state-key="${esc(key)}"><summary>Help</summary>${content}</details>`;
+  }
+
   function memberTables(node) {
     const groups = new Map();
     for (const member of node.members || []) {
@@ -3051,7 +3075,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       ];
       const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
       const description = '<p class="muted">Health is maximum starting health per soldier. Base vision is ordinary forward spotting against standing infantry. Equipped vision reach estimates the maximum of base vision and usable carried scope/binocular aim distance plus aimed spotting radius. Optics require active aiming, not passive all-round vision. Cover, stealth and line of sight affect spotting.</p>';
-      return statSection(`${group} (${count})`, description + comparisonTable(
+      return statSection(`${group} (${count})`, statHelp(`${group} stats help`, description) + comparisonTable(
         members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections
       ));
     }).join('');
@@ -3059,10 +3083,14 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
 
   function penetrationStat(weapon, field) {
     if (!weapon.armor_penetration?.length) return 'Unknown';
-    return weapon.armor_penetration.map(shell => {
+    const shells = weapon.armor_penetration.filter(shell => shell.carried !== false);
+    if (!shells.length) return 'No carried ammunition with penetration data';
+    return shells.map(shell => {
       const name = shell.ammunition === 'default' ? 'Default' : shell.ammunition.toUpperCase();
       const value = Number.isFinite(shell[field]) ? `${number(shell[field])} mm` : 'Unknown';
-      return `${name}: ${value}${shell.carried === false ? ' (not carried)' : ''}`;
+      const range = field === 'penetration_max_range_mm' && Number.isFinite(shell.maximum_range_m)
+        ? ` at ${number(shell.maximum_range_m)} m` : '';
+      return `${name}: ${value}${range}`;
     });
   }
 
@@ -3089,6 +3117,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         caliber_mm: weapon.caliber_mm ?? 'Unknown',
         armour_penetration_at_10_m: penetrationStat(weapon, 'penetration_10m_mm'),
         armour_penetration_at_100_m: penetrationStat(weapon, 'penetration_100m_mm'),
+        armour_penetration_at_max_range: penetrationStat(weapon, 'penetration_max_range_mm'),
         indirect_fire_capability: weapon.indirect_fire ? 'Yes' : 'No',
         reload_time_seconds: weapon.reload_time_seconds ?? 'Unknown',
         rounds_before_reload: weapon.rounds_before_reload ?? 'Unknown',
@@ -3103,7 +3132,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
           ? weapon.ammunition.map(ammo => `${ammo.display_name}: ${ammo.total_count} rounds (${ammo.spare_count} spare + ${ammo.loaded_count} loaded${ammo.shared_reserve ? '; shared reserve' : ''})`)
           : weapon.mount_count != null ? 'Unknown' : null,
       }))}], 'Weapon comparison'
-    ) + '<p class="muted">Penetration is nominal thickness in mm from each shell’s configured projectile-damage curve. Intermediate distances use linear interpolation; values outside the listed curve are Unknown. Angle, armour material and slope modifiers affect actual penetration. Filters use the largest-calibre gun and the same shell for both limits; known uncarried types do not qualify. Where ammo is unknown, configured types are used.</p>');
+    ) + statHelp('Weapon stats help', '<p>Penetration is nominal thickness in mm from each shell’s configured projectile-damage curve. Intermediate distances use linear interpolation; values outside the listed curve are Unknown. Max range is each shell’s configured direct-control limit, including ammunition overrides, not the final zero point of its curve. The distance is shown beside each value. Angle, armour material and slope modifiers affect actual penetration. Filters use the largest-calibre gun and the same shell for all limits; known uncarried types do not qualify. Where ammo is unknown, configured types are used.</p>'));
   }
 
   function armorStats(node, hasVehicle) {
@@ -3111,15 +3140,20 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     const parts = node.armor_parts || [];
     if (!parts.length) return statSection('Armour stats', '<p class="muted">No armour values available.</p>');
     const columns = [...new Set([
-      'default_mm', 'front_mm', 'left_mm', 'right_mm', 'rear_mm', 'top_mm', 'bottom_mm',
+      'front_mm', 'left_mm', 'right_mm', 'rear_mm', 'top_mm', 'bottom_mm',
       ...parts.flatMap(({part, ...values}) => Object.keys(values)),
-    ])].filter(key => parts.some(part => shown(part[key])));
+    ])].filter(key => key !== 'default_mm' && parts.some(part => shown(
+      key.endsWith('_mm') ? part[key] ?? part.default_mm : part[key]
+    )));
     const columnLabel = key => key === 'cast_steel_coefficient' ? 'Cast steel coefficient' : label(key.replace(/_mm$/, '')) + ' (mm)';
     const rows = parts.map(part => {
       const name = label(part.part.replace(/^body(?=\d|$)/i, 'hull').replace(/([a-z])(\d)/gi, '$1_$2'));
-      return `<tr><th scope="row">${esc(name)}</th>${columns.map(key => `<td>${shown(part[key]) ? esc(part[key]) : '—'}</td>`).join('')}</tr>`;
+      return `<tr><th scope="row">${esc(name)}</th>${columns.map(key => {
+        const value = key.endsWith('_mm') ? part[key] ?? part.default_mm : part[key];
+        return `<td>${shown(value) ? esc(value) : '—'}</td>`;
+      }).join('')}</tr>`;
     }).join('');
-    return statSection('Armour stats', `<p class="muted">Thickness in millimeters by part. Default applies to faces without an override. A dash means no explicit value is listed.</p><div class="comparison-scroll" tabindex="0" role="region" aria-label="Vehicle armour"><table class="comparison"><thead><tr><th scope="col">Part</th>${columns.map(key => `<th scope="col">${esc(columnLabel(key))}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`);
+    return statSection('Armour stats', `${statHelp('Armour stats help', '<p>Thickness in millimetres by part. Each face uses its specific override, or the part’s default thickness when no override is given. A dash means neither value is known. Cast steel coefficients are not thicknesses and do not use this fallback.</p>')}<div class="comparison-scroll" tabindex="0" role="region" aria-label="Vehicle armour"><table class="comparison"><thead><tr><th scope="col">Part</th>${columns.map(key => `<th scope="col">${esc(columnLabel(key))}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`);
   }
 
   function renderDetails(node, required) {

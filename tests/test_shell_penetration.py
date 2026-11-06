@@ -99,6 +99,41 @@ class ShellPenetrationTests(unittest.TestCase):
                     self.assertFalse(apcr['carried'])
                     self.assertFalse(by_shell['default']['carried'])
 
+    def test_maximum_range_uses_shell_range_not_curve_endpoint(self):
+        with TemporaryDirectory() as temporary:
+            resource = Path(temporary) / 'resource'
+            pak(resource / 'entity/vehicle.pak', {'-vehicle/tank_medium/tank.def':
+                '{Weaponry {place "gun" {weapon "child"}}}'})
+            pak(resource / 'gamelogic.pak', {
+                'set/stuff/gun/parent': '''{calibre 75} {range 170 200}
+                    {projectileDamageTable {0 90} {250 40}}
+                    {parameters "ap" {projectileDamageTable {10 150} {100 100} {200 60} {215 0}}}
+                    {parameters "heat" {range 170 180}
+                        {projectileDamageTable {0 100} {180 100} {195 0}}}
+                    {parameters "apcr" {maxRange 150}}
+                    {parameters "unresolved" {maxRange %unknown}}
+                    {parameters "outside" {maxRange 500}}
+                ''',
+                'set/stuff/gun/child': '{from "parent"}',
+            })
+            mod = Mod('1', 'Shell range override', Path(temporary) / 'mod')
+            pak(mod.path / 'resource/custom.pak', {'set/stuff/gun/child':
+                '{from "parent" {parameters "ap" {maxRange 100}}}'})
+            for mods, ap_range, ap_penetration in (([], 200, 60), ([mod], 100, 100)):
+                with self.subTest(mods=mods), GameData(resource, mods) as data:
+                    nodes = [{'id': 'tank'}]
+                    annotate_unit_metadata([{'faction': 'eng', 'nodes': nodes}],
+                                           data.view('entity/'), data.view(), {})
+                    rows = {row['ammunition']: row for row in nodes[0]['vehicle_weapons'][0]['armor_penetration']}
+                    self.assertEqual(rows['ap']['maximum_range_m'], ap_range)
+                    self.assertEqual(rows['ap']['penetration_max_range_mm'], ap_penetration)
+                    self.assertEqual(rows['heat']['maximum_range_m'], 180)
+                    self.assertEqual(rows['heat']['penetration_max_range_mm'], 100)
+                    self.assertEqual(rows['apcr']['penetration_max_range_mm'], 60)
+                    self.assertIsNone(rows['unresolved']['maximum_range_m'])
+                    self.assertIsNone(rows['unresolved']['penetration_max_range_mm'])
+                    self.assertIsNone(rows['outside']['penetration_max_range_mm'])
+
 
 if __name__ == '__main__':
     unittest.main()

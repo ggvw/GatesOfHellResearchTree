@@ -107,7 +107,7 @@ movement. Unresolved speeds are shown as Unknown and do not match this filter.
 
 ### Armour penetration
 
-Weapon stats show nominal penetration in millimetres at 10 m and 100 m for each
+Weapon stats show nominal penetration in millimetres at 10 m, 100 m, and maximum range for each
 configured shell type, including ammunition-specific overrides inherited from
 the gun definition. These are the game's projectile penetration curves, not
 health damage or the Firepower calibre-weighted index. Exact table points are
@@ -115,12 +115,19 @@ used where available; intermediate distances use linear interpolation. Values
 outside the curve and unresolved values remain Unknown rather than becoming zero.
 Actual penetration also depends on impact angle, armour material and slope modifiers.
 
-The Weapons section has minimum penetration filters for both distances. They
+Maximum range uses each shell's configured direct-control limit, including
+ammunition-specific overrides, not the last point of the penetration curve.
+The actual distance is shown beside each max-range penetration value. Unknown
+range or a distance outside the penetration curve produces Unknown penetration.
+
+The Weapons section has minimum penetration filters for all three distances. They
 use the largest-calibre weapon in both graph and table modes, and the same shell
-must satisfy both limits. When the gun's carried ammunition is known, uncarried
-shell types are labelled in the stats and excluded from filtering. If ammunition
+must satisfy every active limit. When the gun's carried ammunition is known, uncarried
+shell types are hidden from penetration stats and excluded from filtering. If ammunition
 is unresolved, filtering uses configured types without guaranteeing availability.
-Unknown values do not match an active minimum; Clear filters resets both limits.
+Unknown values do not match an active minimum; Clear filters resets all limits.
+Explanatory text in filter and stats sections is under collapsed Help details;
+expanding help does not hide the filters or statistics themselves.
 
 ### Other weapon and armour filters
 
@@ -128,6 +135,11 @@ Min rounds before reload checks the primary vehicle gun, or any soldier's main
 weapon in an infantry squad. Secondary and additional weapons do not affect
 matching. This is weapon capacity, separate from starting loaded rounds and
 total ammunition carried. Unknown capacities do not match the filter.
+
+The Armour stats table shows each face's override or its part's default thickness,
+without a separate Default (mm) column. Explicit zero thickness stays zero; a dash
+means neither the override nor a default is known. Non-thickness values such as
+cast steel coefficients never use the thickness fallback.
 
 Armour filters set minimum thicknesses for front, left side, right side, rear,
 roof, floor, and default thickness. Choose hull, turret, hull and turret, or any

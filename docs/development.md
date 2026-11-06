@@ -146,5 +146,6 @@ Run the viewer's armour filter checks with Node.js:
 node tests/test_armour_filters.js
 node tests/test_general_filters.js
 node tests/test_penetration_filters.js
+node tests/test_stat_display.js
 node tests/test_unit_table.js
 ```
