@@ -14,6 +14,8 @@ browse an already generated viewer.
 
 - Choose a faction in the top bar and use search to find a unit.
 - In Graph mode, drag to pan, scroll to zoom, or select **Fit tree**.
+- Changing or clearing filters preserves graph zoom and pan. Use **Fit tree**
+  when you want to reframe the visible branches.
 - Select a graph node or a table unit name to open **Unit statistics**.
 - The summary shows CP, RP, total RP including prerequisites, and unit size.
 - Resize the statistics panel by dragging its left edge; close it with **×** or Escape.

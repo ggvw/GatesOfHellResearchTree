@@ -3326,20 +3326,18 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     }, 210);
   });
   const filterControls = [minSizeInput, minInfantryHealthInput, minInfantryVisionInput, minInfantryEquippedVisionInput, minLevelInput, minInfantryAtInput, minUnitSpeedInput, minRoundsInput, minRateInput, minCaliberInput, maxReloadInput, minTurretTurnSpeedInput, minCpInput, maxCpInput, maxTotalRpInput, hasIndirectFireInput, armourPartInput, ...armourControls.values(), ...firepowerControls.values(), ...gunRangeControls.map(control => control.input), ...penetrationControls.map(control => control.input)];
-  for (const control of filterControls) control.addEventListener('input', () => {
-    applyFilters();
-    if (selectedBranchTypes().size) fitTree();
-  });
+  // Filtering updates nodes and layout without changing the user's zoom or pan.
+  for (const control of filterControls) control.addEventListener('input', applyFilters);
   for (const options of [inventoryOptions, weaponRoleOptions, infantryWeaponOptions, specialistOptions]) {
     options.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); });
   }
-  branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); fitTree(); });
+  branchOptions.addEventListener('input', () => { updateFilterSummaries(); applyFilters(); });
   document.getElementById('clear-filters').addEventListener('click', () => {
     for (const input of filterControls) if (input.type === 'number') input.value = '';
     armourPartInput.value = 'main';
     hasIndirectFireInput.value = '';
     for (const input of document.querySelectorAll('.multi-options input')) input.checked = false;
-    updateFilterSummaries(); applyFilters(); fitTree();
+    updateFilterSummaries(); applyFilters();
   });
   document.getElementById('search').addEventListener('input', applyFilters);
   viewModeInput.addEventListener('change', () => setViewMode(viewModeInput.value));
