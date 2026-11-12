@@ -235,7 +235,7 @@ class GameData:
 
     @staticmethod
     def relevant(name):
-        return name.startswith(('set/', 'properties/', 'entity/', 'interface/', 'localizations/'))
+        return name.startswith(('set/', 'properties/', 'entity/', 'interface/', 'localizations/', 'script/'))
 
     def mount_archive(self, path, prefix):
         try:

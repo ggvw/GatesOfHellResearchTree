@@ -714,6 +714,46 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
                               "interactive graph uses last definition only; all definitions retained "
                               "in research_records and duplicate_research_records JSON fields")
                 entries = list(unique.values())
+                from ai_stages import extract_ai, stage_bound, sdl_definitions, add_purchase_alias
+                ai = extract_ai(data, faction)
+                ai_ids = {}
+                # Build side-qualified aliases without changing player lookup semantics.
+                roster_text = re.sub(r';[^\n]*', '', active_roster(data) or '')
+                definitions = sdl_definitions(roster_text)
+                for declaration in re.finditer(r'\("[^"\n]+"(?:[^()"\n]|\w+\([^()]*\))*\)', roster_text):
+                    block = declaration[0]
+                    tokens = parse_token_map(block)
+                    name = tokens.get('name', [None])[0]
+                    side = tokens.get('side', [None])[0]
+                    if name and side:
+                        add_purchase_alias(unit_blocks, block, definitions)
+                for record in ai['records']:
+                    purchase_id = record['purchase_id']
+                    # The trailing army is the Lua purchase side, not part of the SDL ID.
+                    match = re.fullmatch(r'(.+)\(([^()]*)\)', purchase_id)
+                    lookup = purchase_id
+                    if lookup not in unit_blocks and match:
+                        candidate = unit_blocks.get(match[1])
+                        if candidate and parse_token_map(candidate).get('side', [None])[0] == match[2]:
+                            lookup = match[1]
+                    record['roster_id'] = lookup
+                    record['min_stage'] = stage_bound(unit_blocks.get(lookup), 'min_stage', definitions)
+                    record['max_stage'] = stage_bound(unit_blocks.get(lookup), 'max_stage', definitions)
+                    if lookup not in unit_blocks:
+                        message = f'{faction}/{purchase_id}: AI purchase roster definition unresolved'
+                        ai['warnings'].append(message)
+                        data.warn(message)
+                    for field in ('min_stage', 'max_stage'):
+                        if record[field]['state'] != 'known':
+                            message = f'{faction}/{purchase_id}: AI {field} {record[field]["state"]}; eligibility unknown (no default inferred)'
+                            if message not in ai['warnings']:
+                                ai['warnings'].append(message)
+                                data.warn(message)
+                    ai_ids.setdefault(lookup, record)
+                research_ids = set(unique)
+                entries.extend({'id': identifier, 'node_type': 'unit', 'cost': None,
+                                'requires': [], 'position': {'x': 0, 'y': 0}}
+                               for identifier in ai_ids if identifier not in research_ids)
                 if not entries:
                     raise RuntimeError(f"No research nodes parsed from {research_path}")
                 log(
@@ -822,6 +862,9 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
                         }
                     )
 
+                out['ai'] = ai
+                out['ai_nodes'] = [dict(node, requires=[]) for node in out['nodes'] if node['id'] in ai_ids]
+                out['nodes'] = [node for node in out['nodes'] if node['id'] in research_ids]
                 node_ids = {node["id"] for node in out["nodes"]}
                 for node in out["nodes"]:
                     for required in node["requires"]:

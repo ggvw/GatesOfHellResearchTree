@@ -1997,6 +1997,12 @@ def main() -> None:
                       for item in dataset.get("layers", [])]
             if args.exclude_factions:
                 set_hidden_factions(group, args.exclude_factions)
+            for item in group:
+                item.setdefault('viewer_limitations', []).extend(item.get('ai', {}).get('warnings', []))
+                if item.get('ai', {}).get('records'):
+                    item['viewer_limitations'].append('AI stages show configured stage eligibility only, not affordability, selection probability or guaranteed spawning. Engine roster-resource checks are not simulated; unknown bounds remain visible.')
+                item['_research_node_count'] = len(item['nodes'])
+                item['nodes'].extend(item.get('ai_nodes', []))
             with GameData(game_resource_dir, layers) as data:
                 views = GameFiles(data.view("entity/"), data.view(), data.view(), data.view())
                 enrich_trees(group, views)
@@ -2026,6 +2032,10 @@ def main() -> None:
         if len(missing) > 20:
             log(f"  ...and {len(missing) - 20} more")
 
+    for item in trees:
+        split = item.pop('_research_node_count', len(item['nodes']))
+        item['ai_nodes'] = item['nodes'][split:]
+        item['nodes'] = item['nodes'][:split]
     html_path = write_html(trees, output_dir)
     node_count = sum(len(tree["nodes"]) for tree in trees)
     log(f"Wrote {html_path} with {len(trees)} factions and {node_count} nodes")
@@ -2233,6 +2243,15 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <select id="mod" aria-label="Mod" style="max-width:260px" title="Steam Workshop mod"></select>
   <label for="faction">Faction</label>
   <select id="faction" aria-label="Faction"></select>
+  <select id="graph-source" aria-label="Graph source"><option value="research">Player research</option><option value="ai">AI stages</option></select>
+  <span id="ai-controls" hidden>
+    <select id="ai-duration" aria-label="Campaign duration"></select>
+    <select id="ai-variant" aria-label="AI variant"></select>
+    <select id="ai-display" aria-label="AI display"><option value="unlocks">First unlocks</option><option value="eligible">Eligible at stage</option></select>
+    <input id="ai-stage" aria-label="Selected AI stage" type="number" min="0" value="1" style="width:80px">
+    <span id="ai-schedule"></span>
+    <span title="Not actual battle affordability, selection probability, or guaranteed spawning. Unknown engine roster-resource checks are not simulated.">Stage eligibility only ⓘ</span>
+  </span>
   <input id="search" type="search" placeholder="Find a unit…" aria-label="Find a unit">
   <button id="zoom-out" class="graph-control" title="Zoom out">−</button>
   <button id="zoom-in" class="graph-control" title="Zoom in">+</button>
@@ -2438,7 +2457,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   };
   const label = key => statLabels[key] || key.replace(/armor/gi, 'armour').replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   const shown = value => value !== null && value !== undefined && value !== '' && (!Array.isArray(value) || value.length);
-  const number = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+  const number = value => !Number.isFinite(value) ? '—' : Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
 
   const firepowerDefinitions = [
     {key: 'burst_rounds_5s', label: 'Burst output', filter: 'Min burst rounds (5 s)', unit: 'rounds / 5 s', step: 1,
@@ -2766,6 +2785,62 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (viewMode === 'graph' && tree) requestAnimationFrame(fitTree);
   }
 
+  function aiStageNodes(source, variant = 'all', display = 'unlocks', stage = 1) {
+    const templates = new Map((source.ai_nodes || []).map(node => [node.id, node]));
+    const grouped = new Map();
+    for (const record of source.ai?.records || []) {
+      if (variant !== 'all' && String(record.variant) !== variant) continue;
+      if (!grouped.has(record.purchase_id)) grouped.set(record.purchase_id, []);
+      grouped.get(record.purchase_id).push(record);
+    }
+    const nodes = [];
+    for (const [id, records] of grouped) {
+      const first = records[0];
+      const minimums = new Set(records.map(record => record.min_stage?.value));
+      const maximums = new Set(records.map(record => record.max_stage?.value));
+      const minimum = minimums.size === 1 ? first.min_stage?.value : null;
+      const maximum = maximums.size === 1 ? first.max_stage?.value : null;
+      if (display === 'eligible' && minimum !== null && maximum !== null && (stage < minimum || stage > maximum)) continue;
+      const template = templates.get(first.roster_id) || {display_name: id, node_type: 'unit', stats: {}};
+      nodes.push({...template, id, requires: [], cost: null, ai_records: records,
+        ai_min: minimum, ai_max: maximum, ai_category: first.category});
+    }
+    const categories = [...new Set(nodes.map(node => node.ai_category))].sort();
+    const stages = [...new Set(nodes.map(node => node.ai_min))].sort((a,b) => (a ?? Infinity) - (b ?? Infinity));
+    const rows = new Map(), counts = new Map();
+    for (const category of categories) {
+      let height = 1;
+      for (const value of stages) height = Math.max(height, nodes.filter(n => n.ai_category === category && n.ai_min === value).length);
+      rows.set(category, [...counts.values()].reduce((a,b) => a+b, 0)); counts.set(category, height);
+    }
+    for (const node of nodes) {
+      const peers = nodes.filter(n => n.ai_category === node.ai_category && n.ai_min === node.ai_min);
+      node.position = {x: stages.indexOf(node.ai_min), y: rows.get(node.ai_category) + peers.indexOf(node)};
+    }
+    return nodes;
+  }
+
+  function prepareAiTree(source) {
+    const active = document.getElementById('graph-source').value === 'ai';
+    document.getElementById('ai-controls').hidden = !active;
+    if (!active) return source;
+    const duration = document.getElementById('ai-duration'), variant = document.getElementById('ai-variant');
+    const options = (element, values) => {
+      const previous = element.value;
+      element.replaceChildren(...values.map(([value, label]) => Object.assign(document.createElement('option'), {value, textContent: label})));
+      if (values.some(([value]) => value === previous)) element.value = previous;
+    };
+    options(duration, Object.keys(source.ai?.schedules || {}).map(key => [key, key.replaceAll('_', ' ')]));
+    options(variant, [['all', 'All reachable variants'], ...(source.ai?.variants || []).map(value => [String(value), `AI variant ${value}`])]);
+    const stage = Number(document.getElementById('ai-stage').value);
+    const schedule = source.ai?.schedules?.[duration.value] || [];
+    const games = schedule.find(entry => entry.stage >= stage)?.games_played;
+    document.getElementById('ai-schedule').textContent = games === undefined ? 'Stage not scheduled' : `Stage ${stage}: after ${games} games played`;
+    const result = {...source, nodes: aiStageNodes(source, variant.value, document.getElementById('ai-display').value, stage), ai_mode: true};
+    if (!result.nodes.length) result.nodes = [{id: 'ai-empty', display_name: 'No AI units in this selection', node_type: 'unit', requires: [], position: {x:0,y:0}, stats:{}}];
+    return result;
+  }
+
   function renderTree(faction) {
     if (!selectableTrees.some(item => item.faction === faction && (item.mod_id || '') === modSelect.value)) {
       updateFactions();
@@ -2773,6 +2848,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     }
     factionSelect.value = faction;
     tree = selectableTrees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
+    tree = prepareAiTree(tree);
     updateInfantryWeaponOptions();
     byId = new Map(tree.nodes.map(node => [node.id, node]));
     layoutPositions = new Map(
@@ -2807,7 +2883,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const card = document.createElement('article');
       card.className = `node ${node.node_type}`;
       card.style.left = p.x + 'px'; card.style.top = p.y + 'px';
-      card.title = `${node.display_name}\nResearch: ${number(node.cost)}${shown(node.stats?.unit_count) ? `\nUnits: ${node.stats.unit_count}` : ''}`;
+      card.title = `${node.ai_category ? node.ai_category + '\n' : ''}${node.display_name}\nResearch: ${number(node.cost)}${shown(node.stats?.unit_count) ? `\nUnits: ${node.stats.unit_count}` : ''}`;
       const image = node.web_image ? `<img src="${esc(node.web_image)}" alt="">` : '<div class="no-image">?</div>';
       const unitBadge = shown(node.stats?.unit_count) ? `<span class="badge units" title="Amount of units">×${esc(node.stats.unit_count)}</span>` : '';
       const commandPoints = node.unit?.cp;
@@ -2822,7 +2898,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const atWeaponBadge = node.anti_tank_weapon_count > 0 ? `<span class="at-count-badge" title="Infantry carrying AT launchers or AT hand grenades">AT ×${esc(node.anti_tank_weapon_count)}</span>` : '';
       const lowerLeftBadges = cpBadge || reloadBadge || atWeaponBadge ? `<div class="lower-left-badges">${cpBadge}${reloadBadge}${atWeaponBadge}</div>` : '';
       const indirectIcon = node.indirect_fire ? '<span class="indirect-icon" title="Indirect fire capability" aria-label="Indirect fire capability"><svg viewBox="0 0 24 20" aria-hidden="true"><path d="M2 17 Q8 2 18 7" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="2 2"/><path d="M15 4 L20 7 L16 11" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="3" cy="17" r="2" fill="currentColor"/></svg></span>' : '';
-      card.innerHTML = `${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${flaskIcon}${esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
+      card.innerHTML = `${node.ai_category ? `<span style="position:absolute;top:0;left:0;right:0;background:#171b1de8;font-size:10px">${esc(node.ai_category)} · ${node.ai_min == null || node.ai_max == null ? 'eligibility unknown' : 'stage ' + esc(node.ai_min)}</span>` : ''}${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${tree.ai_mode ? `Stage ${esc(node.ai_min ?? '?')} · max ${esc(node.ai_max ?? '?')}` : flaskIcon + esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
       card.addEventListener('click', event => { event.stopPropagation(); selectNode(node.id); });
       nodesLayer.append(card); nodeElements.set(node.id, card);
     }
@@ -3258,6 +3334,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     detailContent.innerHTML = `
       <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
       <div class="totals"><div class="total"><strong>${shown(node.stats?.command_points) ? esc(number(node.stats.command_points)) : '—'}</strong>CP</div><div class="total"><strong>${esc(number(node.cost))}</strong>RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
+      ${tree.ai_mode ? `<div class="notice"><strong>AI stage eligibility only.</strong> Not actual battle affordability, probability, or guaranteed spawning. Engine roster-resource checks are not simulated. Unknown bounds remain unknown.<br>Purchase: ${esc(node.id)}<br>Category: ${esc(node.ai_category || 'Unknown')} · first stage ${esc(node.ai_min ?? '?')} · maximum ${esc(node.ai_max ?? '?')}<br>${(node.ai_records || []).map(record => `Variant ${record.variant}: ${esc(record.source)}:${record.line}`).join('<br>')}</div>` : ''}
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
       ${weaponStats(node, hasVehicle)}
       ${armorStats(node, hasVehicle || node.vehicle_weapons?.length)}
@@ -3380,6 +3457,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     renderTree(factionSelect.value);
   });
   factionSelect.addEventListener('change', () => renderTree(factionSelect.value));
+  for (const id of ['graph-source', 'ai-duration', 'ai-variant', 'ai-display', 'ai-stage']) {
+    document.getElementById(id).addEventListener('change', () => renderTree(factionSelect.value));
+  }
   document.getElementById('clear').addEventListener('click', clearHighlighting);
   document.getElementById('close-details').addEventListener('click', closeStatsPanel);
   document.addEventListener('keydown', event => {
