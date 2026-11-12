@@ -45,4 +45,19 @@ for (const id of ['penetration-filter-help', 'range-filter-help', 'armour-filter
   const tag = source.match(new RegExp(`<details[^>]*id="${id}"[^>]*>`))[0];
   assert.ok(!/\bopen\b/.test(tag));
 }
-console.log('Armour fallback and collapsed help display checks passed.');
+// Capture the actual quantities passed to the rendered comparison table.
+context.comparisonTable = (columns, sections) => JSON.stringify({columns, sections});
+context.node = {members: [
+  {alias: 'known', count: 2, weapons: [{id: 'rifle'}]},
+  {alias: 'unknown', count: null, weapons: [{id: 'rifle'}]},
+  {alias: 'later', count: 1, weapons: [{id: 'rifle'}]},
+]};
+const roster = vm.runInContext('memberTables(node)', context);
+assert.match(roster, /Infantry \(Unknown\)/);
+assert.match(roster, /unknown ×Unknown/);
+const carried = vm.runInContext('weaponStats(node, false)', context);
+assert.match(carried, /"carried_count":null/);
+context.node.members[1].count = 0;
+assert.match(vm.runInContext('memberTables(node)', context), /Infantry \(3\)/);
+assert.match(vm.runInContext('weaponStats(node, false)', context), /"carried_count":3/);
+console.log('Armour fallback, unknown quantities and collapsed help display checks passed.');

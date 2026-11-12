@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile
 
-from game_data import GameData, discover_mods, mod_layers, expand_defines, warning
+from game_data import (GameData, discover_mods, mod_layers, expand_defines, warning,
+                       add_preset_arguments, requested_preset)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -147,6 +148,12 @@ def parse_token_map(text: str) -> dict[str, list[str]]:
     return dict(token_map)
 
 
+def mask_research_comments(text: str) -> str:
+    """Keep quoted semicolons and source offsets, but exclude inactive records."""
+    return re.sub(r'"(?:\\.|[^"\\])*"|;[^\r\n]*',
+                  lambda match: ' ' * len(match[0]) if match[0].startswith(';') else match[0], text)
+
+
 def parse_research_entries(text: str) -> list[dict]:
     """Parse the compact research-node records from a faction research file."""
     entries = []
@@ -159,7 +166,8 @@ def parse_research_entries(text: str) -> list[dict]:
         r'\{\s*(tech\s+)?"([^"]+)"\s*requires\s*"([^"]*)"'
         r"\s*costs\s+([0-9.]+)\s+position\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*\}"
     )
-    for match in pattern.finditer(text):
+    clean = mask_research_comments(text)
+    for match in pattern.finditer(clean):
         research_section = next(
             (name for position, name in reversed(sections) if position < match.start()),
             None,
@@ -175,7 +183,7 @@ def parse_research_entries(text: str) -> list[dict]:
             }
         )
     node_ids = {entry["id"] for entry in entries}
-    positions = _section_text(text, "positions")
+    positions = _section_text(clean, "positions")
     for identifier, x, y in re.findall(r'\{\s*"([^"]+)"\s+(-?[0-9.]+)\s+(-?[0-9.]+)\s*\}', positions):
         if identifier not in node_ids:
             entries.append({"id": identifier, "node_type": "unit", "requires": [], "cost": 0,
@@ -454,11 +462,13 @@ def parse_unit_block(node_id: str, block: str) -> dict:
                         {
                             "slot": key,
                             "alias": alias.strip(),
-                            "count": int(count.strip()),
+                            "count": int(count.strip()) if re.fullmatch(r'\d+', count.strip()) else None,
+                            "raw_count": count.strip(),
                         }
                     )
 
-    unit_count = sum(member["count"] for member in members) if members else None
+    unit_count = (sum(member["count"] for member in members)
+                  if members and all(member['count'] is not None for member in members) else None)
     return {
         "id": node_id,
         "definition_type": tuple_match.group(1) if tuple_match else None,
@@ -529,7 +539,7 @@ def describe_unit_members(
     breed_paths: dict[str, list[str]],
     infantry_role_cp: dict[str, int | float],
     gamelogic_zip: ZipFile,
-) -> tuple[list[dict], float, int]:
+) -> tuple[list[dict], float | None, int]:
     """Resolve a unit's members and calculate inherited command points."""
     details = []
     total_cost = 0.0
@@ -553,7 +563,7 @@ def describe_unit_members(
             resolved_breed_count += 1
 
         cost = declaration.get("cost") if declaration else None
-        member_cost = cost * count if cost is not None else None
+        member_cost = cost * count if cost is not None and count is not None else None
         if member_cost is not None:
             total_cost += member_cost
 
@@ -567,7 +577,7 @@ def describe_unit_members(
         command_points_each = infantry_role_cp.get(role_class) if role_class else None
         member_command_points = (
             0 if count == 0 else
-            command_points_each * count if command_points_each is not None else None
+            command_points_each * count if command_points_each is not None and count is not None else None
         )
         if member_command_points is None:
             all_command_points_known = False
@@ -578,6 +588,7 @@ def describe_unit_members(
             {
                 "alias": alias,
                 "count": count,
+                "raw_count": member.get('raw_count'),
                 "slot": member["slot"],
                 "declaration": declaration,
                 "breed_file": breed,
@@ -607,7 +618,7 @@ def describe_unit_members(
         unit["cp"] = None
         unit["cp_source"] = "unresolved_member_command_points"
 
-    return details, total_cost, resolved_breed_count
+    return details, (total_cost if all(member['count'] is not None for member in unit['members']) else None), resolved_breed_count
 
 
 def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *, quiet: bool = False) -> None:
@@ -691,12 +702,17 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
                 research_text = read_text(gamelogic_zip, research_path)
                 unit_blocks, breed_declarations, breed_paths = build_unit_lookup(faction, gamelogic_zip)
                 entries = parse_research_entries(research_text)
-                records = len(re.findall(r'\{\s*(?:tech\s+)?"[^"]+"\s*requires', research_text))
+                records = len(re.findall(r'\{\s*(?:tech\s+)?"[^"]+"\s*requires', mask_research_comments(research_text)))
                 if records > len(entries):
                     data.warn(f"{research_path}: unsupported or malformed research records ({records} records, {len(entries)} parsed)")
+                source_entries = entries
                 unique = {entry["id"]: entry for entry in entries}
-                if len(unique) != len(entries):
-                    data.warn(f"{research_path}: duplicate node IDs; last definition wins")
+                duplicate_ids = sorted(identifier for identifier in unique
+                                       if sum(entry['id'] == identifier for entry in entries) > 1)
+                if duplicate_ids:
+                    data.warn(f"{research_path}: viewer limitation: duplicate IDs {duplicate_ids}; "
+                              "interactive graph uses last definition only; all definitions retained "
+                              "in research_records and duplicate_research_records JSON fields")
                 entries = list(unique.values())
                 if not entries:
                     raise RuntimeError(f"No research nodes parsed from {research_path}")
@@ -708,6 +724,9 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
 
                 out = {
                     "faction": faction,
+                    "research_records": source_entries,
+                    "duplicate_research_records": [entry for entry in source_entries if entry['id'] in duplicate_ids],
+                    "viewer_limitations": ([f'Duplicate research IDs {duplicate_ids}: interactive graph uses last definition only; see research_records for all grants/categories.'] if duplicate_ids else []),
                     "source": {
                         "research_file": research_path,
                         "roster_inf_file": roster_inf_path,
@@ -735,6 +754,11 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
                         lookup_id = normalize_node_lookup_id(entry["id"])
                     if lookup_id in unit_blocks:
                         unit_info = parse_unit_block(entry["id"], unit_blocks[lookup_id])
+                        for member in unit_info['members']:
+                            if member['count'] is None:
+                                data.warn(f"{faction}/{entry['id']}: malformed member count "
+                                          f"{member['slot']}({member['alias']}:{member['raw_count']}); "
+                                          "raw value retained, count and derived totals unresolved")
                         resolved_units += 1
                     elif entry["node_type"] == "unit":
                         missing_unit_ids.append(entry["id"])
@@ -833,7 +857,7 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
                     log(f"  WARNING: images not found: {', '.join(missing_image_ids)}", quiet=quiet)
                 log(f"  Wrote {json_path} ({json_path.stat().st_size:,} bytes)", quiet=quiet)
             except (OSError, KeyError, ValueError, RuntimeError, IndexError) as exc:
-                warning(f"Skipping faction {faction}: parsing error or missing reference: {exc}")
+                data.warn(f"Skipping faction {faction}: parsing error or missing reference: {exc}")
 
     output_files = sum(1 for path in output_dir.rglob("*") if path.is_file())
     log(
@@ -843,8 +867,23 @@ def export_dataset(game_resource_dir: Path, output_dir: Path, data: GameData, *,
     )
 
 
-def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False) -> None:
-    """Export the base game and each installed mod as separate selectable datasets."""
+def export(game_resource_dir: Path, output_dir: Path, *, quiet: bool = False,
+           preset=None, layers=None) -> None:
+    """Export one explicit preset, or legacy base/per-installed-mod datasets."""
+    if layers is not None:
+        log(f"Preset {preset}; load order: {' -> '.join(item.id for item in layers)}", quiet=quiet)
+        with GameData(game_resource_dir, layers) as data:
+            export_dataset(game_resource_dir, output_dir, data, quiet=quiet)
+            discovered = discover_factions(data.view())
+            exported = sorted(path.stem for path in output_dir.glob('*.json'))
+            dataset = {'id': f'preset:{preset}', 'name': preset, 'preset': preset,
+                       'directory': '.', 'layers': [item.metadata() for item in layers],
+                       'factions_discovered': discovered, 'factions_exported': exported,
+                       'warnings': sorted(data.reported)}
+        (output_dir / 'datasets.json').write_text(json.dumps([dataset], indent=2) + '\n', encoding='utf-8')
+        if sorted(discovered) != exported:
+            raise RuntimeError(f'Incomplete preset export: discovered {discovered}, exported {exported}; see warnings')
+        return
     mods = discover_mods(game_resource_dir)
     log(f"Detected {len(mods)} Workshop mods", quiet=quiet)
     with GameData(game_resource_dir) as data:
@@ -889,6 +928,7 @@ def parse_args() -> object:
         default=DEFAULT_OUTPUT_DIR,
         help=f"directory to replace with exported JSON and images (default: {DEFAULT_OUTPUT_DIR})",
     )
+    add_preset_arguments(parser)
     parser.add_argument("--quiet", action="store_true", help="suppress progress messages")
     return parser.parse_args()
 
@@ -896,7 +936,8 @@ def parse_args() -> object:
 if __name__ == "__main__":
     args = parse_args()
     try:
-        export(args.game_path, args.output, quiet=args.quiet)
-    except (FileNotFoundError, KeyError, RuntimeError) as exc:
+        layers = requested_preset(args)
+        export(args.game_path, args.output, quiet=args.quiet, preset=args.preset, layers=layers)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print(f"[research-export] ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

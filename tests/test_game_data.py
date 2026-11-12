@@ -192,7 +192,7 @@ class GameDataTests(unittest.TestCase):
         self.assertTrue(all((website / url).is_file() for url in urls))
         html = write_html(base + selected, website).read_text()
         self.assertLess(html.index('id="mod"'), html.index('id="faction"'))
-        self.assertIn("modSelect.value = ''", html)
+        self.assertIn("modSelect.value = mods.has('') ? '' : mods.keys().next().value", html)
 
 
 if __name__ == '__main__':

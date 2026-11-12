@@ -11,7 +11,8 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from game_data import ArchiveView, GameData, Mod, open_archive, warning
+from game_data import (ArchiveView, GameData, Mod, open_archive, warning,
+                       add_preset_arguments, requested_preset, validate_preset_dataset)
 
 from firepower import annotate_firepower
 
@@ -511,7 +512,7 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
                         multiplier = float(modifiers[-1]) if modifiers else 1.0
                         speeds[path] = round(base_speed * multiplier, 2)
                     member["unit_speed_kmh"] = speeds.get(path)
-                    if member.get("count", 0) > 0 and member["unit_speed_kmh"] is not None:
+                    if (member.get("count") or 0) > 0 and member["unit_speed_kmh"] is not None:
                         member_speeds.append(member["unit_speed_kmh"])
 
                 node["unit_speed_kmh"] = node.get("vehicle_speed_kmh")
@@ -523,7 +524,8 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
                     and not definition_type.startswith("squad_vehicle")
                     and not unit.get("vehicle")
                 )
-                if node["unit_speed_kmh"] is None and on_foot and member_speeds:
+                if (node["unit_speed_kmh"] is None and on_foot and member_speeds
+                        and all(member.get('count') is not None for member in node.get('members') or [])):
                     node["unit_speed_kmh"] = min(member_speeds)
                     node["unit_speed_basis"] = "Sprint speed (slowest member)"
 
@@ -1170,7 +1172,11 @@ def annotate_infantry_capabilities(
             for name in item_names
         }
         if normalized_items & at_hand_weapons:
-            node["anti_tank_weapon_count"] += int(member.get("count") or 0)
+            count = member.get('count')
+            if count is None or node['anti_tank_weapon_count'] is None:
+                node['anti_tank_weapon_count'] = None
+            else:
+                node['anti_tank_weapon_count'] += count
 
     node["weapon_roles"] = sorted(weapon_roles)
     node["infantry_weapons"] = sorted(infantry_weapons)
@@ -1727,7 +1733,7 @@ def annotate_unit_metadata(
                 # remains infantry and a howitzer tank remains a tank.
                 carried_weapons = [
                     weapon["id"] for member in node.get("members") or []
-                    if member.get("count", 0) > 0
+                    if (member.get("count") or 0) > 0
                     for weapon in member.get("weapons") or []
                 ] if node["unit_class"] == "infantry" else []
                 node["indirect_fire"] = entity_indirect_fire or any(
@@ -1746,7 +1752,7 @@ def annotate_unit_metadata(
                     primary_capacities = [
                         member["weapons"][0]["rounds_before_reload"]
                         for member in node.get("members") or []
-                        if member.get("count", 0) > 0 and member["weapons"]
+                        if (member.get("count") or 0) > 0 and member["weapons"]
                     ]
                 node["primary_rounds_before_reload"] = max(
                     (value for value in primary_capacities if value is not None),
@@ -1756,13 +1762,18 @@ def annotate_unit_metadata(
                     node["vehicle_weapons"][:1] if node["vehicle_weapons"] else [
                         member["weapons"][0] for member in node.get("members") or []
                         if node["unit_class"] == "infantry"
-                        and member.get("count", 0) > 0 and member["weapons"]
+                        and (member.get("count") or 0) > 0 and member["weapons"]
                     ]
                 )
                 node["primary_rate_of_fire_rpm"] = max(
                     (weapon["rate_of_fire_rpm"] for weapon in primary_weapons
                      if weapon["rate_of_fire_rpm"] is not None), default=None,
                 )
+
+                if (node['unit_class'] == 'infantry' and not node['vehicle_weapons']
+                        and any(member.get('count') is None for member in node.get('members') or [])):
+                    node['primary_rounds_before_reload'] = None
+                    node['primary_rate_of_fire_rpm'] = None
 
                 node["infantry_level"] = (
                     node.get("unit_level") if node["unit_class"] == "infantry" else None
@@ -1833,6 +1844,18 @@ def write_html(trees: list[dict], output_dir: Path) -> Path:
         .replace("\u2029", "\\u2029")
     )
     html = HTML_TEMPLATE.replace("__TREE_DATA__", embedded_json)
+    from html import escape
+    notices = [f"{tree['faction']}: {notice}" for tree in trees
+               for notice in tree.get('viewer_limitations', [])]
+    notices.extend(f"{tree['faction']}/{node['id']}: malformed roster count; member count and totals unresolved."
+                   for tree in trees for node in tree['nodes']
+                   if any(member.get('count') is None for member in node.get('members') or []))
+    if notices:
+        html = html.replace('<!--DATA_LIMITATIONS-->',
+                            '<details id="data-limitations"><summary>Data limitations '
+                            f'({len(notices)})</summary><ul>'
+                            + ''.join(f'<li>{escape(notice)}</li>' for notice in notices)
+                            + '</ul></details>', 1)
     target = output_dir / "index.html"
     target.write_text(html, encoding="utf-8")
     return target
@@ -1866,6 +1889,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help=f"directory to replace with the generated site (default: {DEFAULT_OUTPUT_DIR})",
     )
+    add_preset_arguments(parser)
+    parser.add_argument('--exclude-factions', nargs='+', default=[], metavar='ID',
+                        help='operator-supplied hidden faction IDs for --preset viewer only; not game validation')
     return parser.parse_args()
 
 
@@ -1912,8 +1938,23 @@ def enrich_trees(trees: list[dict], game_files: GameFiles) -> None:
     log("Calculated firepower estimates and comparison-group percentiles")
 
 
+def set_hidden_factions(trees: list[dict], excluded: list[str]) -> None:
+    """Presentation only: retain source trees, reject typos and empty selectors."""
+    hidden = set(excluded)
+    available = {tree['faction'] for tree in trees}
+    if hidden - available:
+        raise ValueError(f'Unknown excluded factions: {sorted(hidden - available)}')
+    if not available - hidden:
+        raise ValueError('Faction exclusions must leave at least one selectable faction')
+    for tree in trees:
+        tree['hidden_faction'] = tree['faction'] in hidden
+
+
 def main() -> None:
     args = parse_args()
+    selected_layers = requested_preset(args)
+    if args.exclude_factions and selected_layers is None:
+        raise RuntimeError('--exclude-factions requires explicit --preset-config and --preset')
     game_resource_dir = args.game_path.resolve()
     input_dir = args.input.resolve()
     output_dir = args.output.resolve()
@@ -1935,15 +1976,27 @@ def main() -> None:
     datasets = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else [
         {"id": "", "name": "None", "directory": ".", "layers": []}
     ]
+    if selected_layers is not None:
+        validate_preset_dataset(datasets, args.preset, selected_layers)
+    if args.exclude_factions:
+        known = set(datasets[0]['factions_exported'])
+        if set(args.exclude_factions) - known or not known - set(args.exclude_factions):
+            raise RuntimeError('Excluded faction IDs must exist and leave at least one visible faction')
     trees = []
     for dataset in datasets:
+        if dataset.get('warnings'):
+            warning(f"Export recorded {len(dataset['warnings'])} resource warnings; see datasets.json")
         try:
             dataset_dir = (input_dir / dataset["directory"]).resolve()
             dataset_dir.relative_to(input_dir)
             group = load_trees(dataset_dir)
+            if selected_layers is not None and sorted(tree['faction'] for tree in group) != sorted(dataset['factions_exported']):
+                raise ValueError('Preset faction files do not match export manifest')
             layers = [Mod(item["id"], item["name"], Path(item["path"]),
                           tuple(item.get("requires", [])), tuple(item.get("deletes", [])))
                       for item in dataset.get("layers", [])]
+            if args.exclude_factions:
+                set_hidden_factions(group, args.exclude_factions)
             with GameData(game_resource_dir, layers) as data:
                 views = GameFiles(data.view("entity/"), data.view(), data.view(), data.view())
                 enrich_trees(group, views)
@@ -1993,13 +2046,19 @@ html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background:
 button, select, input { color: inherit; background: #252b2e; border: 1px solid #596164; border-radius: 5px; padding: 7px 10px; }
 button { cursor: pointer; }
 button:hover { background: #343c40; }
-#toolbar { height: 54px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; overflow-x: auto; }
+body { display: flex; flex-direction: column; }
+#viewer-header { flex: none; min-width: 0; }
+#workspace { position: relative; flex: 1; min-height: 0; }
+#data-limitations { background: var(--table-surface); border-bottom: 1px solid var(--line); }
+#data-limitations summary { cursor: pointer; padding: 6px 12px; font-weight: 650; }
+#data-limitations ul { margin: 0; padding: 8px 32px; max-height: 25vh; overflow: auto; }
+#toolbar { min-height: 54px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; overflow-x: auto; }
 #toolbar > * { flex-shrink: 0; }
 #search { width: min(260px, 24vw); }
 #hint { margin-left: auto; color: #9ca6a8; font-size: 12px; }
-#filter-panel { position: absolute; z-index: 12; left: 0; top: 54px; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
+#filter-panel { position: absolute; z-index: 12; left: 0; top: 0; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
 body.filters-collapsed #filter-panel { transform: translateX(-100%); }
-#filter-toggle { position: absolute; z-index: 13; left: 300px; top: 66px; width: 31px; padding: 7px 5px; border-left: 0; border-radius: 0 5px 5px 0; transition: left .2s; }
+#filter-toggle { position: absolute; z-index: 13; left: 300px; top: 12px; width: 31px; padding: 7px 5px; border-left: 0; border-radius: 0 5px 5px 0; transition: left .2s; }
 body.filters-collapsed #filter-toggle { left: 0; }
 .filter-heading { margin: 0 0 10px; font-size: 16px; }
 .filter-group { margin: 0 0 14px; padding: 10px; border: 1px solid #343a3d; border-radius: 6px; }
@@ -2022,11 +2081,11 @@ body.filters-collapsed #filter-toggle { left: 0; }
 .branch-group { margin: 5px 0 2px; color: #e0ad4f; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .multi-options label:hover { background: #2b3336; border-radius: 3px; }
 #clear-filters { width: 100%; margin: 2px 0 9px; }
-#viewport { position: absolute; inset: 54px 0 0 300px; overflow: hidden; cursor: grab; background-color: #0d1112; background-image: radial-gradient(#303638 1px, transparent 1px); background-size: 24px 24px; transition: left .2s; }
+#viewport { position: absolute; inset: 0 0 0 300px; overflow: hidden; cursor: grab; background-color: #0d1112; background-image: radial-gradient(#303638 1px, transparent 1px); background-size: 24px 24px; transition: left .2s; }
 body.stats-open #viewport { right: var(--stats-width, 560px); }
 body.filters-collapsed #viewport { left: 0; }
 #viewport.dragging { cursor: grabbing; }
-#table-view { position: absolute; inset: 54px 0 0 300px; overflow: auto; padding: 6px 18px 24px 38px; background: var(--table-background); }
+#table-view { position: absolute; inset: 0 0 0 300px; overflow: auto; padding: 6px 18px 24px 38px; background: var(--table-background); }
 #table-view[hidden], #viewport[hidden] { display: none; }
 body.filters-collapsed #table-view { left: 0; }
 body.stats-open #table-view { right: var(--stats-width, 560px); }
@@ -2080,7 +2139,7 @@ body.table-mode .graph-control, body.table-mode #hint { display: none; }
 .node.search-match { outline: 4px solid #d65cff; outline-offset: 2px; }
 .node.filter-match { background: #24563d; border-color: #73e4aa; box-shadow: 0 0 15px #50d79499; }
 .node.filter-match .node-title { background: #24563d; }
-#details { position: absolute; z-index: 11; top: 54px; bottom: 0; right: 0; width: var(--stats-width, 560px); display: flex; flex-direction: column; padding: 0 0 0 7px; color: inherit; background: #171b1d; border-left: 1px solid #495154; box-shadow: -5px 0 18px #0006; overflow: hidden; }
+#details { position: absolute; z-index: 11; top: 0; bottom: 0; right: 0; width: var(--stats-width, 560px); display: flex; flex-direction: column; padding: 0 0 0 7px; color: inherit; background: #171b1d; border-left: 1px solid #495154; box-shadow: -5px 0 18px #0006; overflow: hidden; }
 #details[hidden] { display: none; }
 #stats-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 7px; cursor: col-resize; touch-action: none; background: #495154; }
 #stats-resize:hover, #stats-resize:focus-visible { background: var(--accent); }
@@ -2165,6 +2224,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
 </style>
 </head>
 <body>
+<div id="viewer-header">
+<!--DATA_LIMITATIONS-->
 <header id="toolbar">
   <label for="view-mode">View</label>
   <select id="view-mode" aria-label="View mode"><option value="graph">Graph</option><option value="table">Table</option></select>
@@ -2180,6 +2241,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <button id="theme" aria-label="Toggle light and dark mode">☀ Light mode</button>
   <span id="hint">Drag to pan · wheel to zoom · click a node for details</span>
 </header>
+</div>
+<main id="workspace" aria-label="Research viewer">
 <button id="filter-toggle" title="Collapse filters" aria-label="Collapse filters" aria-expanded="true">‹</button>
 <aside id="filter-panel">
   <h2 class="filter-heading">Show</h2>
@@ -2294,6 +2357,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   </header>
   <div id="detail-content"></div>
 </aside>
+</main>
 <script id="tree-data" type="application/json">__TREE_DATA__</script>
 <script>
 (() => {
@@ -2456,26 +2520,30 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   try { initialTheme = localStorage.getItem('research-tree-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); } catch (_) {}
   applyTheme(initialTheme);
 
-  const mods = new Map([['', 'None']]);
-  for (const item of trees) mods.set(item.mod_id || '', item.mod_name || 'None');
+  const selectableTrees = trees.filter(item => !item.hidden_faction);
+  const mods = new Map();
+  for (const item of selectableTrees) mods.set(item.mod_id || '', item.mod_name || 'None');
   for (const [id, name] of mods) {
     const option = document.createElement('option');
     option.value = id;
     option.textContent = name;
     modSelect.append(option);
   }
-  modSelect.value = '';
+  if (!mods.size) throw new Error('No research datasets available');
+  modSelect.value = mods.has('') ? '' : mods.keys().next().value;
 
   function updateFactions() {
+    if (!mods.has(modSelect.value)) modSelect.value = mods.has('') ? '' : mods.keys().next().value;
     const previous = factionSelect.value;
     factionSelect.replaceChildren();
-    for (const item of trees.filter(item => (item.mod_id || '') === modSelect.value)) {
+    for (const item of selectableTrees.filter(item => (item.mod_id || '') === modSelect.value)) {
       const option = document.createElement('option');
       option.value = item.faction;
       option.textContent = item.faction.toUpperCase();
       factionSelect.append(option);
     }
-    if ([...factionSelect.options].some(option => option.value === previous)) factionSelect.value = previous;
+    factionSelect.value = [...factionSelect.options].some(option => option.value === previous)
+      ? previous : factionSelect.options[0].value;
   }
   updateFactions();
 
@@ -2699,7 +2767,12 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   }
 
   function renderTree(faction) {
-    tree = trees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
+    if (!selectableTrees.some(item => item.faction === faction && (item.mod_id || '') === modSelect.value)) {
+      updateFactions();
+      faction = factionSelect.value;
+    }
+    factionSelect.value = faction;
+    tree = selectableTrees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
     updateInfantryWeaponOptions();
     byId = new Map(tree.nodes.map(node => [node.id, node]));
     layoutPositions = new Map(
@@ -3073,10 +3146,11 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
           return stats;
         })},
       ];
-      const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
+      const count = members.every(member => Number.isFinite(member.count))
+        ? members.reduce((sum, member) => sum + member.count, 0) : 'Unknown';
       const description = '<p class="muted">Health is maximum starting health per soldier. Base vision is ordinary forward spotting against standing infantry. Equipped vision reach estimates the maximum of base vision and usable carried scope/binocular aim distance plus aimed spotting radius. Optics require active aiming, not passive all-round vision. Cover, stealth and line of sight affect spotting.</p>';
       return statSection(`${group} (${count})`, statHelp(`${group} stats help`, description) + comparisonTable(
-        members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections
+        members.map(member => `${member.display_name || member.alias} ×${member.count == null ? 'Unknown' : member.count}`), sections
       ));
     }).join('');
   }
@@ -3102,7 +3176,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         const key = weapon.id || weapon.display_name;
         if (!carried.has(key)) carried.set(key, {...weapon, count: 0, carriers: new Set()});
         const entry = carried.get(key);
-        entry.count += Number(member.count || 0);
+        entry.count = entry.count !== null && Number.isFinite(member.count)
+          ? entry.count + member.count : null;
         entry.carriers.add(member.display_name || member.alias);
       }
     }
