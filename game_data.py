@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import posixpath
 import re
 from zipfile import BadZipFile, ZipFile
@@ -97,6 +98,68 @@ def mod_layers(mod, mods):
     return result
 
 
+def add_preset_arguments(parser):
+    parser.add_argument('--preset-config', type=Path,
+                        help='ModManager config.json; requires --preset (no Workshop discovery)')
+    parser.add_argument('--preset', help='exact named ModManager preset; one combined dataset')
+    parser.add_argument('--local-layer', type=Path, action='append', default=[],
+                        help='explicit local mod directory appended after preset; repeat in load order')
+
+
+def preset_layers(config_path, preset, local_layers=()):
+    """Read only explicit layers. Dependencies must occur earlier; never add/reorder."""
+    config = json.loads(Path(config_path).expanduser().read_text(encoding='utf-8'))
+    ids = config.get('presets', {}).get(preset)
+    if not isinstance(ids, list) or not ids:
+        raise ValueError(f'Unknown or empty preset: {preset!r}')
+    root = Path(config['workshop_path']).expanduser()
+    folders = []
+    for item in ids:
+        if not isinstance(item, str) or not item.isdigit():
+            raise ValueError(f'Invalid Workshop ID in preset: {item!r}')
+        folders.append((item, root / item))
+    folders.extend((Path(path).name, Path(path).expanduser()) for path in local_layers)
+    result, seen = [], set()
+    for identifier, folder in folders:
+        if identifier in seen:
+            raise ValueError(f'Duplicate layer ID: {identifier}')
+        folder = folder.resolve()
+        text = (folder / 'mod.info').read_text(encoding='utf-8-sig', errors='replace')
+        requires = tuple(value.removeprefix('mod_')
+                         for block in re.findall(r'\{require\s+([^}]+)\}', text, re.I)
+                         for value in re.findall(r'"([^"]+)"', block))
+        missing = [value for value in requires if value not in seen]
+        if missing:
+            raise ValueError(f'Layer {identifier} requires earlier layer(s) {missing}; '
+                             'preset order is never changed and dependencies are never added')
+        name = re.search(r'\{name\s+"([^"]+)"', text, re.I)
+        result.append(Mod(identifier, name[1] if name else identifier, folder, requires,
+                          tuple(re.findall(r'\{delete\s+"([^"]+)"', text, re.I))))
+        seen.add(identifier)
+    return result
+
+
+def requested_preset(args):
+    if bool(args.preset_config) != bool(args.preset):
+        raise ValueError('--preset-config and --preset must be supplied together')
+    if args.local_layer and not args.preset:
+        raise ValueError('--local-layer requires --preset-config and --preset')
+    return (preset_layers(args.preset_config, args.preset, args.local_layer)
+            if args.preset else None)
+
+
+def validate_preset_dataset(datasets, preset, layers):
+    """HTML must use the exact ordered stack recorded by the preset export."""
+    if (len(datasets) != 1 or datasets[0].get('preset') != preset
+            or datasets[0].get('layers') != [item.metadata() for item in layers]):
+        raise ValueError('Export manifest does not match requested preset/layer stack; re-export first')
+    dataset = datasets[0]
+    if (not dataset.get('factions_exported')
+            or sorted(dataset.get('factions_discovered', [])) != sorted(dataset['factions_exported'])):
+        raise ValueError('Preset export is incomplete; inspect warnings and re-export first')
+    return datasets
+
+
 def normalize(name):
     return posixpath.normpath(str(name).replace('\\', '/')).lstrip('/').lower()
 
@@ -150,8 +213,11 @@ class GameData:
             self.mount(self.resource_dir)
             self.mount_localizations(self.resource_dir.parent)
             for mod in self.layers:
+                if not mod.path.is_dir():
+                    raise ValueError(f'Mod directory no longer exists: {mod.path}')
                 if not (mod.path / 'resource').is_dir():
-                    raise ValueError(f'Mod resource directory no longer exists: {mod.path}')
+                    self.warn(f'Layer {mod.id} has no resource directory; retained in stack, '
+                              'external installer/DLL behavior is not emulated')
                 for deleted in mod.deletes:
                     prefix = normalize(deleted).removeprefix('resource/').rstrip('/')
                     for name in list(self.files):
@@ -169,7 +235,7 @@ class GameData:
 
     @staticmethod
     def relevant(name):
-        return name.startswith(('set/', 'properties/', 'entity/', 'interface/', 'localizations/'))
+        return name.startswith(('set/', 'properties/', 'entity/', 'interface/', 'localizations/', 'script/'))
 
     def mount_archive(self, path, prefix):
         try:

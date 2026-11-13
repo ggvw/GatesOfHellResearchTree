@@ -11,7 +11,8 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from game_data import ArchiveView, GameData, Mod, open_archive, warning
+from game_data import (ArchiveView, GameData, Mod, open_archive, warning,
+                       add_preset_arguments, requested_preset, validate_preset_dataset)
 
 from firepower import annotate_firepower
 
@@ -511,7 +512,7 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
                         multiplier = float(modifiers[-1]) if modifiers else 1.0
                         speeds[path] = round(base_speed * multiplier, 2)
                     member["unit_speed_kmh"] = speeds.get(path)
-                    if member.get("count", 0) > 0 and member["unit_speed_kmh"] is not None:
+                    if (member.get("count") or 0) > 0 and member["unit_speed_kmh"] is not None:
                         member_speeds.append(member["unit_speed_kmh"])
 
                 node["unit_speed_kmh"] = node.get("vehicle_speed_kmh")
@@ -523,7 +524,8 @@ def annotate_unit_speeds(trees: list[dict], game_files: GameFiles) -> None:
                     and not definition_type.startswith("squad_vehicle")
                     and not unit.get("vehicle")
                 )
-                if node["unit_speed_kmh"] is None and on_foot and member_speeds:
+                if (node["unit_speed_kmh"] is None and on_foot and member_speeds
+                        and all(member.get('count') is not None for member in node.get('members') or [])):
                     node["unit_speed_kmh"] = min(member_speeds)
                     node["unit_speed_basis"] = "Sprint speed (slowest member)"
 
@@ -1170,7 +1172,11 @@ def annotate_infantry_capabilities(
             for name in item_names
         }
         if normalized_items & at_hand_weapons:
-            node["anti_tank_weapon_count"] += int(member.get("count") or 0)
+            count = member.get('count')
+            if count is None or node['anti_tank_weapon_count'] is None:
+                node['anti_tank_weapon_count'] = None
+            else:
+                node['anti_tank_weapon_count'] += count
 
     node["weapon_roles"] = sorted(weapon_roles)
     node["infantry_weapons"] = sorted(infantry_weapons)
@@ -1727,7 +1733,7 @@ def annotate_unit_metadata(
                 # remains infantry and a howitzer tank remains a tank.
                 carried_weapons = [
                     weapon["id"] for member in node.get("members") or []
-                    if member.get("count", 0) > 0
+                    if (member.get("count") or 0) > 0
                     for weapon in member.get("weapons") or []
                 ] if node["unit_class"] == "infantry" else []
                 node["indirect_fire"] = entity_indirect_fire or any(
@@ -1746,7 +1752,7 @@ def annotate_unit_metadata(
                     primary_capacities = [
                         member["weapons"][0]["rounds_before_reload"]
                         for member in node.get("members") or []
-                        if member.get("count", 0) > 0 and member["weapons"]
+                        if (member.get("count") or 0) > 0 and member["weapons"]
                     ]
                 node["primary_rounds_before_reload"] = max(
                     (value for value in primary_capacities if value is not None),
@@ -1756,13 +1762,18 @@ def annotate_unit_metadata(
                     node["vehicle_weapons"][:1] if node["vehicle_weapons"] else [
                         member["weapons"][0] for member in node.get("members") or []
                         if node["unit_class"] == "infantry"
-                        and member.get("count", 0) > 0 and member["weapons"]
+                        and (member.get("count") or 0) > 0 and member["weapons"]
                     ]
                 )
                 node["primary_rate_of_fire_rpm"] = max(
                     (weapon["rate_of_fire_rpm"] for weapon in primary_weapons
                      if weapon["rate_of_fire_rpm"] is not None), default=None,
                 )
+
+                if (node['unit_class'] == 'infantry' and not node['vehicle_weapons']
+                        and any(member.get('count') is None for member in node.get('members') or [])):
+                    node['primary_rounds_before_reload'] = None
+                    node['primary_rate_of_fire_rpm'] = None
 
                 node["infantry_level"] = (
                     node.get("unit_level") if node["unit_class"] == "infantry" else None
@@ -1833,6 +1844,18 @@ def write_html(trees: list[dict], output_dir: Path) -> Path:
         .replace("\u2029", "\\u2029")
     )
     html = HTML_TEMPLATE.replace("__TREE_DATA__", embedded_json)
+    from html import escape
+    notices = [f"{tree['faction']}: {notice}" for tree in trees
+               for notice in tree.get('viewer_limitations', [])]
+    notices.extend(f"{tree['faction']}/{node['id']}: malformed roster count; member count and totals unresolved."
+                   for tree in trees for node in tree['nodes']
+                   if any(member.get('count') is None for member in node.get('members') or []))
+    if notices:
+        html = html.replace('<!--DATA_LIMITATIONS-->',
+                            '<details id="data-limitations"><summary>Data limitations '
+                            f'({len(notices)})</summary><ul>'
+                            + ''.join(f'<li>{escape(notice)}</li>' for notice in notices)
+                            + '</ul></details>', 1)
     target = output_dir / "index.html"
     target.write_text(html, encoding="utf-8")
     return target
@@ -1866,6 +1889,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_DIR,
         help=f"directory to replace with the generated site (default: {DEFAULT_OUTPUT_DIR})",
     )
+    add_preset_arguments(parser)
+    parser.add_argument('--exclude-factions', nargs='+', default=[], metavar='ID',
+                        help='operator-supplied hidden faction IDs for --preset viewer only; not game validation')
     return parser.parse_args()
 
 
@@ -1912,8 +1938,23 @@ def enrich_trees(trees: list[dict], game_files: GameFiles) -> None:
     log("Calculated firepower estimates and comparison-group percentiles")
 
 
+def set_hidden_factions(trees: list[dict], excluded: list[str]) -> None:
+    """Presentation only: retain source trees, reject typos and empty selectors."""
+    hidden = set(excluded)
+    available = {tree['faction'] for tree in trees}
+    if hidden - available:
+        raise ValueError(f'Unknown excluded factions: {sorted(hidden - available)}')
+    if not available - hidden:
+        raise ValueError('Faction exclusions must leave at least one selectable faction')
+    for tree in trees:
+        tree['hidden_faction'] = tree['faction'] in hidden
+
+
 def main() -> None:
     args = parse_args()
+    selected_layers = requested_preset(args)
+    if args.exclude_factions and selected_layers is None:
+        raise RuntimeError('--exclude-factions requires explicit --preset-config and --preset')
     game_resource_dir = args.game_path.resolve()
     input_dir = args.input.resolve()
     output_dir = args.output.resolve()
@@ -1935,15 +1976,33 @@ def main() -> None:
     datasets = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else [
         {"id": "", "name": "None", "directory": ".", "layers": []}
     ]
+    if selected_layers is not None:
+        validate_preset_dataset(datasets, args.preset, selected_layers)
+    if args.exclude_factions:
+        known = set(datasets[0]['factions_exported'])
+        if set(args.exclude_factions) - known or not known - set(args.exclude_factions):
+            raise RuntimeError('Excluded faction IDs must exist and leave at least one visible faction')
     trees = []
     for dataset in datasets:
+        if dataset.get('warnings'):
+            warning(f"Export recorded {len(dataset['warnings'])} resource warnings; see datasets.json")
         try:
             dataset_dir = (input_dir / dataset["directory"]).resolve()
             dataset_dir.relative_to(input_dir)
             group = load_trees(dataset_dir)
+            if selected_layers is not None and sorted(tree['faction'] for tree in group) != sorted(dataset['factions_exported']):
+                raise ValueError('Preset faction files do not match export manifest')
             layers = [Mod(item["id"], item["name"], Path(item["path"]),
                           tuple(item.get("requires", [])), tuple(item.get("deletes", [])))
                       for item in dataset.get("layers", [])]
+            if args.exclude_factions:
+                set_hidden_factions(group, args.exclude_factions)
+            for item in group:
+                item.setdefault('viewer_limitations', []).extend(item.get('ai', {}).get('warnings', []))
+                if item.get('ai', {}).get('records'):
+                    item['viewer_limitations'].append('AI stages show configured stage eligibility only, not affordability, selection probability or guaranteed spawning. Engine roster-resource checks are not simulated; unknown bounds remain visible.')
+                item['_research_node_count'] = len(item['nodes'])
+                item['nodes'].extend(item.get('ai_nodes', []))
             with GameData(game_resource_dir, layers) as data:
                 views = GameFiles(data.view("entity/"), data.view(), data.view(), data.view())
                 enrich_trees(group, views)
@@ -1973,6 +2032,10 @@ def main() -> None:
         if len(missing) > 20:
             log(f"  ...and {len(missing) - 20} more")
 
+    for item in trees:
+        split = item.pop('_research_node_count', len(item['nodes']))
+        item['ai_nodes'] = item['nodes'][split:]
+        item['nodes'] = item['nodes'][:split]
     html_path = write_html(trees, output_dir)
     node_count = sum(len(tree["nodes"]) for tree in trees)
     log(f"Wrote {html_path} with {len(trees)} factions and {node_count} nodes")
@@ -1993,13 +2056,19 @@ html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background:
 button, select, input { color: inherit; background: #252b2e; border: 1px solid #596164; border-radius: 5px; padding: 7px 10px; }
 button { cursor: pointer; }
 button:hover { background: #343c40; }
-#toolbar { height: 54px; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; overflow-x: auto; }
+body { display: flex; flex-direction: column; }
+#viewer-header { flex: none; min-width: 0; }
+#workspace { position: relative; flex: 1; min-height: 0; }
+#data-limitations { background: var(--table-surface); border-bottom: 1px solid var(--line); }
+#data-limitations summary { cursor: pointer; padding: 6px 12px; font-weight: 650; }
+#data-limitations ul { margin: 0; padding: 8px 32px; max-height: 25vh; overflow: auto; }
+#toolbar { min-height: 54px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; background: #171b1d; border-bottom: 1px solid #343a3d; overflow-x: auto; }
 #toolbar > * { flex-shrink: 0; }
 #search { width: min(260px, 24vw); }
 #hint { margin-left: auto; color: #9ca6a8; font-size: 12px; }
-#filter-panel { position: absolute; z-index: 12; left: 0; top: 54px; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
+#filter-panel { position: absolute; z-index: 12; left: 0; top: 0; bottom: 0; width: 300px; padding: 14px 13px 24px; overflow-y: auto; background: #121617f7; border-right: 1px solid #343a3d; transition: transform .2s; }
 body.filters-collapsed #filter-panel { transform: translateX(-100%); }
-#filter-toggle { position: absolute; z-index: 13; left: 300px; top: 66px; width: 31px; padding: 7px 5px; border-left: 0; border-radius: 0 5px 5px 0; transition: left .2s; }
+#filter-toggle { position: absolute; z-index: 13; left: 300px; top: 12px; width: 31px; padding: 7px 5px; border-left: 0; border-radius: 0 5px 5px 0; transition: left .2s; }
 body.filters-collapsed #filter-toggle { left: 0; }
 .filter-heading { margin: 0 0 10px; font-size: 16px; }
 .filter-group { margin: 0 0 14px; padding: 10px; border: 1px solid #343a3d; border-radius: 6px; }
@@ -2022,11 +2091,11 @@ body.filters-collapsed #filter-toggle { left: 0; }
 .branch-group { margin: 5px 0 2px; color: #e0ad4f; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .multi-options label:hover { background: #2b3336; border-radius: 3px; }
 #clear-filters { width: 100%; margin: 2px 0 9px; }
-#viewport { position: absolute; inset: 54px 0 0 300px; overflow: hidden; cursor: grab; background-color: #0d1112; background-image: radial-gradient(#303638 1px, transparent 1px); background-size: 24px 24px; transition: left .2s; }
+#viewport { position: absolute; inset: 0 0 0 300px; overflow: hidden; cursor: grab; background-color: #0d1112; background-image: radial-gradient(#303638 1px, transparent 1px); background-size: 24px 24px; transition: left .2s; }
 body.stats-open #viewport { right: var(--stats-width, 560px); }
 body.filters-collapsed #viewport { left: 0; }
 #viewport.dragging { cursor: grabbing; }
-#table-view { position: absolute; inset: 54px 0 0 300px; overflow: auto; padding: 6px 18px 24px 38px; background: var(--table-background); }
+#table-view { position: absolute; inset: 0 0 0 300px; overflow: auto; padding: 6px 18px 24px 38px; background: var(--table-background); }
 #table-view[hidden], #viewport[hidden] { display: none; }
 body.filters-collapsed #table-view { left: 0; }
 body.stats-open #table-view { right: var(--stats-width, 560px); }
@@ -2051,6 +2120,17 @@ body.table-mode .graph-control, body.table-mode #hint { display: none; }
 .edge { stroke: var(--line); stroke-width: 3; fill: none; opacity: .7; }
 .edge.highlight { stroke: var(--required); stroke-width: 5; opacity: 1; }
 .edge.dimmed { opacity: .12; }
+.ai-stage-band { position: absolute; background: #163c48b8; border: 2px solid #5f939f; border-radius: 8px; color: #e4f3f5; }
+.ai-stage-band.alternate { background: #39324ab8; border-color: #9482af; }
+.ai-stage-band h2 { margin: 8px 12px; font-size: 24px; }
+.ai-category-heading { position: absolute; left: 0; right: 0; margin: 0; padding: 6px 12px; height: 36px; box-sizing: border-box; background: #08191cbb; border-top: 1px solid #91a6ac; font-size: 20px; }
+.ai-tile-cell { position: absolute; left: 0; right: 0; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.ai-tile-cell:focus-visible { outline: 3px solid var(--accent); }
+.ai-card-label { position: absolute; top: 0; left: 0; right: 0; background: #171b1de8; color: #e4eded; font-size: 10px; }
+html[data-theme="light"] .ai-card-label { background: #eef4f1ee; color: #182022; }
+html[data-theme="light"] .ai-stage-band { background: #c8e2e9; border-color: #557e89; color: #172b33; }
+html[data-theme="light"] .ai-stage-band.alternate { background: #e0d6ed; border-color: #8b74a2; }
+html[data-theme="light"] .ai-category-heading { background: #ffffffa8; border-color: #889b9e; }
 .node { position: absolute; width: 150px; height: 184px; border: 2px solid #687174; border-radius: 7px; overflow: hidden; background: #22282a; box-shadow: 0 3px 8px #0009; cursor: pointer; user-select: none; transition: opacity .15s, border-color .15s, box-shadow .15s; }
 .node:hover { border-color: #f0d28a; box-shadow: 0 0 12px #e0ad4f88; z-index: 3; }
 .node.tech { border-color: #9a7d3d; }
@@ -2080,7 +2160,7 @@ body.table-mode .graph-control, body.table-mode #hint { display: none; }
 .node.search-match { outline: 4px solid #d65cff; outline-offset: 2px; }
 .node.filter-match { background: #24563d; border-color: #73e4aa; box-shadow: 0 0 15px #50d79499; }
 .node.filter-match .node-title { background: #24563d; }
-#details { position: absolute; z-index: 11; top: 54px; bottom: 0; right: 0; width: var(--stats-width, 560px); display: flex; flex-direction: column; padding: 0 0 0 7px; color: inherit; background: #171b1d; border-left: 1px solid #495154; box-shadow: -5px 0 18px #0006; overflow: hidden; }
+#details { position: absolute; z-index: 11; top: 0; bottom: 0; right: 0; width: var(--stats-width, 560px); display: flex; flex-direction: column; padding: 0 0 0 7px; color: inherit; background: #171b1d; border-left: 1px solid #495154; box-shadow: -5px 0 18px #0006; overflow: hidden; }
 #details[hidden] { display: none; }
 #stats-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 7px; cursor: col-resize; touch-action: none; background: #495154; }
 #stats-resize:hover, #stats-resize:focus-visible { background: var(--accent); }
@@ -2165,6 +2245,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
 </style>
 </head>
 <body>
+<div id="viewer-header">
+<!--DATA_LIMITATIONS-->
 <header id="toolbar">
   <label for="view-mode">View</label>
   <select id="view-mode" aria-label="View mode"><option value="graph">Graph</option><option value="table">Table</option></select>
@@ -2172,6 +2254,15 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <select id="mod" aria-label="Mod" style="max-width:260px" title="Steam Workshop mod"></select>
   <label for="faction">Faction</label>
   <select id="faction" aria-label="Faction"></select>
+  <select id="graph-source" aria-label="Graph source"><option value="research">Player research</option><option value="ai">AI stages</option></select>
+  <span id="ai-controls" hidden>
+    <select id="ai-duration" aria-label="Campaign duration"></select>
+    <select id="ai-variant" aria-label="AI variant"></select>
+    <select id="ai-display" aria-label="AI display"><option value="unlocks">First unlocks</option><option value="eligible">Eligible at stage</option></select>
+    <input id="ai-stage" aria-label="Selected AI stage" type="number" min="0" value="1" style="width:80px">
+    <span id="ai-schedule"></span>
+    <span title="Not actual battle affordability, selection probability, or guaranteed spawning. Unknown engine roster-resource checks are not simulated.">Stage eligibility only ⓘ</span>
+  </span>
   <input id="search" type="search" placeholder="Find a unit…" aria-label="Find a unit">
   <button id="zoom-out" class="graph-control" title="Zoom out">−</button>
   <button id="zoom-in" class="graph-control" title="Zoom in">+</button>
@@ -2180,6 +2271,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   <button id="theme" aria-label="Toggle light and dark mode">☀ Light mode</button>
   <span id="hint">Drag to pan · wheel to zoom · click a node for details</span>
 </header>
+</div>
+<main id="workspace" aria-label="Research viewer">
 <button id="filter-toggle" title="Collapse filters" aria-label="Collapse filters" aria-expanded="true">‹</button>
 <aside id="filter-panel">
   <h2 class="filter-heading">Show</h2>
@@ -2294,6 +2387,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   </header>
   <div id="detail-content"></div>
 </aside>
+</main>
 <script id="tree-data" type="application/json">__TREE_DATA__</script>
 <script>
 (() => {
@@ -2374,7 +2468,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   };
   const label = key => statLabels[key] || key.replace(/armor/gi, 'armour').replaceAll('_', ' ').replace(/\b\w/g, ch => ch.toUpperCase());
   const shown = value => value !== null && value !== undefined && value !== '' && (!Array.isArray(value) || value.length);
-  const number = value => Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
+  const number = value => !Number.isFinite(value) ? '—' : Number.isInteger(value) ? String(value) : String(Number(value.toFixed(2)));
 
   const firepowerDefinitions = [
     {key: 'burst_rounds_5s', label: 'Burst output', filter: 'Min burst rounds (5 s)', unit: 'rounds / 5 s', step: 1,
@@ -2456,26 +2550,30 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   try { initialTheme = localStorage.getItem('research-tree-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'); } catch (_) {}
   applyTheme(initialTheme);
 
-  const mods = new Map([['', 'None']]);
-  for (const item of trees) mods.set(item.mod_id || '', item.mod_name || 'None');
+  const selectableTrees = trees.filter(item => !item.hidden_faction);
+  const mods = new Map();
+  for (const item of selectableTrees) mods.set(item.mod_id || '', item.mod_name || 'None');
   for (const [id, name] of mods) {
     const option = document.createElement('option');
     option.value = id;
     option.textContent = name;
     modSelect.append(option);
   }
-  modSelect.value = '';
+  if (!mods.size) throw new Error('No research datasets available');
+  modSelect.value = mods.has('') ? '' : mods.keys().next().value;
 
   function updateFactions() {
+    if (!mods.has(modSelect.value)) modSelect.value = mods.has('') ? '' : mods.keys().next().value;
     const previous = factionSelect.value;
     factionSelect.replaceChildren();
-    for (const item of trees.filter(item => (item.mod_id || '') === modSelect.value)) {
+    for (const item of selectableTrees.filter(item => (item.mod_id || '') === modSelect.value)) {
       const option = document.createElement('option');
       option.value = item.faction;
       option.textContent = item.faction.toUpperCase();
       factionSelect.append(option);
     }
-    if ([...factionSelect.options].some(option => option.value === previous)) factionSelect.value = previous;
+    factionSelect.value = [...factionSelect.options].some(option => option.value === previous)
+      ? previous : factionSelect.options[0].value;
   }
   updateFactions();
 
@@ -2698,8 +2796,145 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (viewMode === 'graph' && tree) requestAnimationFrame(fitTree);
   }
 
+  function aiStageNodes(source, variant = 'all', display = 'unlocks', stage = 1) {
+    const templates = new Map((source.ai_nodes || []).map(node => [node.id, node]));
+    const grouped = new Map();
+    for (const record of source.ai?.records || []) {
+      if (variant !== 'all' && String(record.variant) !== variant) continue;
+      if (!grouped.has(record.purchase_id)) grouped.set(record.purchase_id, []);
+      grouped.get(record.purchase_id).push(record);
+    }
+    const nodes = [];
+    for (const [id, records] of grouped) {
+      const first = records[0];
+      const minimums = new Set(records.map(record => record.min_stage?.value));
+      const maximums = new Set(records.map(record => record.max_stage?.value));
+      const minimum = minimums.size === 1 ? first.min_stage?.value : null;
+      const maximum = maximums.size === 1 ? first.max_stage?.value : null;
+      if (display === 'eligible' && minimum !== null && maximum !== null && (stage < minimum || stage > maximum)) continue;
+      const template = templates.get(first.roster_id) || {display_name: id, node_type: 'unit', stats: {}};
+      nodes.push({...template, id, requires: [], cost: null, ai_records: records,
+        ai_min: minimum, ai_max: maximum, ai_category: first.category});
+    }
+    layoutAiCells(nodes);
+    return nodes;
+  }
+
+  function layoutAiCells(nodes) {
+    const categories = [...new Set(nodes.map(node => node.ai_category))].sort();
+    const stages = [...new Set(nodes.map(node => node.ai_min))].sort((a,b) => (a ?? Infinity) - (b ?? Infinity));
+    const cells = new Map();
+    for (const node of nodes) {
+      const key = JSON.stringify([node.ai_category, node.ai_min]);
+      if (!cells.has(key)) cells.set(key, []);
+      cells.get(key).push(node);
+    }
+    const widths = stages.map(stage => Math.min(6, Math.max(2, Math.ceil(Math.sqrt(Math.max(1,
+      ...categories.map(category => (cells.get(JSON.stringify([category, stage])) || []).length)))))));
+    let x = 0;
+    const columns = stages.map((stage, index) => {
+      const column = {stage, x, width: widths[index] * 166 + 20, tiles: widths[index]};
+      x += column.width + 16;
+      return column;
+    });
+    let y = 48;
+    const rows = categories.map(category => {
+      const tileRows = Math.min(2, Math.max(...columns.map(column => Math.ceil((cells.get(JSON.stringify([category, column.stage])) || []).length / column.tiles)), 1));
+      const row = {category, y, height: 38 + tileRows * 200 - 10};
+      y += row.height + 12;
+      return row;
+    });
+    for (const row of rows) for (const column of columns) {
+      const peers = cells.get(JSON.stringify([row.category, column.stage])) || [];
+      peers.forEach((node, index) => {
+        node.position = {x: (column.x + 10 + index % column.tiles * 166) / 184,
+          y: (row.y + 38 + Math.floor(index / column.tiles) * 200) / 202};
+        node.ai_tile = {x: 10 + index % column.tiles * 166, y: Math.floor(index / column.tiles) * 200};
+      });
+    }
+    return {columns, rows, width: x, height: y, cells};
+  }
+
+  function renderAiCells(visibleIds = null) {
+    const nodes = tree.nodes.filter(node => !visibleIds || visibleIds.has(node.id));
+    const layout = layoutAiCells(nodes);
+    const scrollPositions = new Map([...nodesLayer.querySelectorAll('.ai-tile-cell')].map(cell => [cell.dataset.cellKey, cell.scrollTop]));
+    nodesLayer.replaceChildren();
+    layoutPositions = new Map();
+    for (const [id, card] of nodeElements) card.style.display = !visibleIds || visibleIds.has(id) ? '' : 'none';
+    for (const [index, column] of layout.columns.entries()) {
+      const band = document.createElement('section');
+      band.className = 'ai-stage-band' + (index % 2 ? ' alternate' : '');
+      Object.assign(band.style, {left: PAD + column.x + 'px', top: PAD + 'px', width: column.width + 'px', height: layout.height + 'px'});
+      const heading = document.createElement('h2');
+      heading.textContent = column.stage == null ? 'Unknown stage' : `Stage ${column.stage}`;
+      band.append(heading);
+      for (const row of layout.rows) {
+        const peers = layout.cells.get(JSON.stringify([row.category, column.stage])) || [];
+        const title = document.createElement('h3');
+        title.className = 'ai-category-heading';
+        title.style.top = row.y + 'px';
+        title.textContent = `${row.category || 'Unknown category'} · ${peers.length}`;
+        band.append(title);
+        const cell = document.createElement('div');
+        cell.className = 'ai-tile-cell';
+        cell.dataset.cellKey = JSON.stringify([row.category, column.stage]);
+        cell.tabIndex = 0;
+        cell.setAttribute('aria-label', `${heading.textContent}, ${title.textContent}. Scroll for more units.`);
+        Object.assign(cell.style, {top: row.y + 38 + 'px', height: row.height - 38 + 'px'});
+        for (const node of peers) {
+          const card = nodeElements.get(node.id);
+          card.style.left = node.ai_tile.x + 'px'; card.style.top = node.ai_tile.y + 'px';
+          cell.append(card);
+          layoutPositions.set(node.id, {x: PAD + column.x + node.ai_tile.x, y: PAD + row.y + 38 + node.ai_tile.y});
+        }
+        // Wheel scrolling stays local to a cell; drag its heading or the gaps to pan.
+        cell.addEventListener('wheel', event => { if (!event.ctrlKey) event.stopPropagation(); }, {passive:true});
+        cell.addEventListener('pointerdown', event => event.stopPropagation());
+        band.append(cell);
+      }
+      nodesLayer.append(band);
+      for (const cell of band.querySelectorAll('.ai-tile-cell')) cell.scrollTop = scrollPositions.get(cell.dataset.cellKey) || 0;
+    }
+    tree.ai_layout = layout;
+    worldWidth = PAD * 2 + layout.width; worldHeight = PAD * 2 + layout.height;
+    world.style.width = worldWidth + 'px'; world.style.height = worldHeight + 'px';
+    edgesLayer.setAttribute('width', worldWidth); edgesLayer.setAttribute('height', worldHeight);
+    edgesLayer.setAttribute('viewBox', `0 0 ${worldWidth} ${worldHeight}`);
+  }
+
+  function prepareAiTree(source) {
+    const active = document.getElementById('graph-source').value === 'ai';
+    document.getElementById('ai-controls').hidden = !active;
+    document.getElementById('hint').textContent = active
+      ? 'Scroll cells for more units · drag headings/gaps to pan · Ctrl+wheel to zoom'
+      : 'Drag to pan · wheel to zoom · click a node for details';
+    if (!active) return source;
+    const duration = document.getElementById('ai-duration'), variant = document.getElementById('ai-variant');
+    const options = (element, values) => {
+      const previous = element.value;
+      element.replaceChildren(...values.map(([value, label]) => Object.assign(document.createElement('option'), {value, textContent: label})));
+      if (values.some(([value]) => value === previous)) element.value = previous;
+    };
+    options(duration, Object.keys(source.ai?.schedules || {}).map(key => [key, key.replaceAll('_', ' ')]));
+    options(variant, [['all', 'All reachable variants'], ...(source.ai?.variants || []).map(value => [String(value), `AI variant ${value}`])]);
+    const stage = Number(document.getElementById('ai-stage').value);
+    const schedule = source.ai?.schedules?.[duration.value] || [];
+    const games = schedule.find(entry => entry.stage >= stage)?.games_played;
+    document.getElementById('ai-schedule').textContent = games === undefined ? 'Stage not scheduled' : `Stage ${stage}: after ${games} games played`;
+    const result = {...source, nodes: aiStageNodes(source, variant.value, document.getElementById('ai-display').value, stage), ai_mode: true};
+    if (!result.nodes.length) result.nodes = [{id: 'ai-empty', display_name: 'No AI units in this selection', node_type: 'unit', requires: [], position: {x:0,y:0}, stats:{}}];
+    return result;
+  }
+
   function renderTree(faction) {
-    tree = trees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
+    if (!selectableTrees.some(item => item.faction === faction && (item.mod_id || '') === modSelect.value)) {
+      updateFactions();
+      faction = factionSelect.value;
+    }
+    factionSelect.value = faction;
+    tree = selectableTrees.find(item => item.faction === faction && (item.mod_id || '') === modSelect.value);
+    tree = prepareAiTree(tree);
     updateInfantryWeaponOptions();
     byId = new Map(tree.nodes.map(node => [node.id, node]));
     layoutPositions = new Map(
@@ -2734,7 +2969,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const card = document.createElement('article');
       card.className = `node ${node.node_type}`;
       card.style.left = p.x + 'px'; card.style.top = p.y + 'px';
-      card.title = `${node.display_name}\nResearch: ${number(node.cost)}${shown(node.stats?.unit_count) ? `\nUnits: ${node.stats.unit_count}` : ''}`;
+      card.title = `${node.ai_category ? node.ai_category + '\n' : ''}${node.display_name}\nResearch: ${number(node.cost)}${shown(node.stats?.unit_count) ? `\nUnits: ${node.stats.unit_count}` : ''}`;
       const image = node.web_image ? `<img src="${esc(node.web_image)}" alt="">` : '<div class="no-image">?</div>';
       const unitBadge = shown(node.stats?.unit_count) ? `<span class="badge units" title="Amount of units">×${esc(node.stats.unit_count)}</span>` : '';
       const commandPoints = node.unit?.cp;
@@ -2749,7 +2984,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const atWeaponBadge = node.anti_tank_weapon_count > 0 ? `<span class="at-count-badge" title="Infantry carrying AT launchers or AT hand grenades">AT ×${esc(node.anti_tank_weapon_count)}</span>` : '';
       const lowerLeftBadges = cpBadge || reloadBadge || atWeaponBadge ? `<div class="lower-left-badges">${cpBadge}${reloadBadge}${atWeaponBadge}</div>` : '';
       const indirectIcon = node.indirect_fire ? '<span class="indirect-icon" title="Indirect fire capability" aria-label="Indirect fire capability"><svg viewBox="0 0 24 20" aria-hidden="true"><path d="M2 17 Q8 2 18 7" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="2 2"/><path d="M15 4 L20 7 L16 11" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="3" cy="17" r="2" fill="currentColor"/></svg></span>' : '';
-      card.innerHTML = `${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${flaskIcon}${esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
+      card.innerHTML = `${node.ai_category ? `<span class="ai-card-label">${esc(node.ai_category)} · ${node.ai_min == null || node.ai_max == null ? 'eligibility unknown' : 'stage ' + esc(node.ai_min)}</span>` : ''}${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${tree.ai_mode ? `Stage ${esc(node.ai_min ?? '?')} · max ${esc(node.ai_max ?? '?')}` : flaskIcon + esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
       card.addEventListener('click', event => { event.stopPropagation(); selectNode(node.id); });
       nodesLayer.append(card); nodeElements.set(node.id, card);
     }
@@ -2760,6 +2995,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   }
 
   function updateGraphLayout(visibleIds = null) {
+    if (tree.ai_mode) { renderAiCells(visibleIds); return; }
     const visibleNodes = tree.nodes.filter(node => !visibleIds || visibleIds.has(node.id));
     const compact = visibleIds !== null;
     const visibleRows = [...new Set(visibleNodes.map(node => node.position.y))].sort((a, b) => a - b);
@@ -3073,10 +3309,11 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
           return stats;
         })},
       ];
-      const count = members.reduce((sum, member) => sum + Number(member.count || 0), 0);
+      const count = members.every(member => Number.isFinite(member.count))
+        ? members.reduce((sum, member) => sum + member.count, 0) : 'Unknown';
       const description = '<p class="muted">Health is maximum starting health per soldier. Base vision is ordinary forward spotting against standing infantry. Equipped vision reach estimates the maximum of base vision and usable carried scope/binocular aim distance plus aimed spotting radius. Optics require active aiming, not passive all-round vision. Cover, stealth and line of sight affect spotting.</p>';
       return statSection(`${group} (${count})`, statHelp(`${group} stats help`, description) + comparisonTable(
-        members.map(member => `${member.display_name || member.alias} ×${member.count}`), sections
+        members.map(member => `${member.display_name || member.alias} ×${member.count == null ? 'Unknown' : member.count}`), sections
       ));
     }).join('');
   }
@@ -3102,7 +3339,8 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
         const key = weapon.id || weapon.display_name;
         if (!carried.has(key)) carried.set(key, {...weapon, count: 0, carriers: new Set()});
         const entry = carried.get(key);
-        entry.count += Number(member.count || 0);
+        entry.count = entry.count !== null && Number.isFinite(member.count)
+          ? entry.count + member.count : null;
         entry.carriers.add(member.display_name || member.alias);
       }
     }
@@ -3183,6 +3421,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     detailContent.innerHTML = `
       <div class="detail-head">${image}<div><h2>${esc(node.display_name)}</h2><div class="muted">${esc(node.node_type)}</div></div></div>
       <div class="totals"><div class="total"><strong>${shown(node.stats?.command_points) ? esc(number(node.stats.command_points)) : '—'}</strong>CP</div><div class="total"><strong>${esc(number(node.cost))}</strong>RP</div><div class="total"><strong>${esc(number(totalCost))}</strong>Total RP</div><div class="total"><strong>${shown(node.stats?.unit_count) ? esc(node.stats.unit_count) : '—'}</strong>Units</div></div>
+      ${tree.ai_mode ? `<div class="notice"><strong>AI stage eligibility only.</strong> Not actual battle affordability, probability, or guaranteed spawning. Engine roster-resource checks are not simulated. Unknown bounds remain unknown.<br>Purchase: ${esc(node.id)}<br>Category: ${esc(node.ai_category || 'Unknown')} · first stage ${esc(node.ai_min ?? '?')} · maximum ${esc(node.ai_max ?? '?')}<br>${(node.ai_records || []).map(record => `Variant ${record.variant}: ${esc(record.source)}:${record.line}`).join('<br>')}</div>` : ''}
       ${missing.size ? `<div class="notice">Missing prerequisite data: ${[...missing].map(esc).join(', ')}</div>` : ''}
       ${weaponStats(node, hasVehicle)}
       ${armorStats(node, hasVehicle || node.vehicle_weapons?.length)}
@@ -3197,8 +3436,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (viewMode === 'table') return;
     const availableWidth = viewport.clientWidth;
     const availableHeight = viewport.clientHeight;
-    scale = Math.min(.8, availableWidth / worldWidth, availableHeight / worldHeight);
-    scale = Math.max(.06, scale);
+    scale = tree.ai_mode
+      ? Math.min(.8, Math.max(1, availableWidth - 24) / worldWidth, Math.max(1, availableHeight - 24) / worldHeight)
+      : Math.max(.06, Math.min(.8, availableWidth / worldWidth, availableHeight / worldHeight));
     tx = (availableWidth - worldWidth * scale) / 2;
     ty = Math.max(12, (availableHeight - worldHeight * scale) / 2);
     setTransform();
@@ -3206,6 +3446,16 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
 
   function startView() {
     if (viewMode === 'table') return;
+    if (tree.ai_mode && tree.ai_layout?.columns.length) {
+      const layout = tree.ai_layout;
+      const bottom = layout.rows[Math.min(2, layout.rows.length - 1)];
+      const height = bottom ? PAD + bottom.y + bottom.height + 20 : 500;
+      scale = Math.max(70 / NODE_W, Math.min(.8, (viewport.clientHeight - 24) / height,
+        (viewport.clientWidth - 24) / (layout.columns[0].width + PAD * 2)));
+      tx = 12; ty = 12;
+      setTransform();
+      return;
+    }
     scale = Math.max(.18, Math.min(.65, viewport.clientWidth * .92 / worldWidth));
     tx = (viewport.clientWidth - worldWidth * scale) / 2;
     ty = 20;
@@ -3213,7 +3463,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   }
 
   function zoomAt(factor, cx = viewport.clientWidth / 2, cy = viewport.clientHeight / 2) {
-    const next = Math.max(.05, Math.min(2.5, scale * factor));
+    const next = tree.ai_mode
+      ? Math.min(2.5, scale * factor)
+      : Math.max(.05, Math.min(2.5, scale * factor));
     const wx = (cx - tx) / scale, wy = (cy - ty) / scale;
     tx = cx - wx * next; ty = cy - wy * next; scale = next; setTransform();
   }
@@ -3223,7 +3475,15 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (!selectedNodeId || nodeElements.get(selectedNodeId)?.style.display === 'none') return;
     const node = byId.get(selectedNodeId);
     if (!node) return;
-    const position = nodePosition(node), margin = 12;
+    const position = {...nodePosition(node)}, margin = 12;
+    if (tree.ai_mode) {
+      const card = nodeElements.get(node.id), cell = card?.closest('.ai-tile-cell');
+      if (cell) {
+        if (card.offsetTop < cell.scrollTop) cell.scrollTop = card.offsetTop;
+        else if (card.offsetTop + NODE_H > cell.scrollTop + cell.clientHeight) cell.scrollTop = card.offsetTop + NODE_H - cell.clientHeight;
+        position.y -= cell.scrollTop;
+      }
+    }
     scale = Math.min(scale, Math.max(.05, (viewport.clientWidth - margin * 2) / NODE_W));
     const left = position.x * scale + tx, top = position.y * scale + ty;
     if (left < margin) tx += margin - left;
@@ -3305,6 +3565,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     renderTree(factionSelect.value);
   });
   factionSelect.addEventListener('change', () => renderTree(factionSelect.value));
+  for (const id of ['graph-source', 'ai-duration', 'ai-variant', 'ai-display', 'ai-stage']) {
+    document.getElementById(id).addEventListener('change', () => renderTree(factionSelect.value));
+  }
   document.getElementById('clear').addEventListener('click', clearHighlighting);
   document.getElementById('close-details').addEventListener('click', closeStatsPanel);
   document.addEventListener('keydown', event => {

@@ -6,4 +6,8 @@ __pycache__/
 # Generated from locally installed game archives.
 research_export/
 research_tree_html/
+research_export_ultrahotmod/
+research_tree_html_ultrahotmod/
+/layout-fixed-desktop.png
+/layout-six-factions.png
 codex.txt

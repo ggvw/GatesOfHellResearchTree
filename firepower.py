@@ -64,11 +64,12 @@ def firepower_group(node: dict) -> str:
     return "Other armed vehicles"
 
 
-def summarize_weapons(weapons: list[tuple[dict, int]], cp: float | None) -> dict:
+def summarize_weapons(weapons: list[tuple[dict, int | None]], cp: float | None) -> dict:
     """Combine quantities within one weapon slot, never across weapon slots."""
     profiles = [(weapon_firepower(weapon), count) for weapon, count in weapons]
     metrics = dict.fromkeys(METRIC_KEYS)
-    if profiles:
+    quantities_known = all(count is not None for _, count in weapons)
+    if profiles and quantities_known:
         for key in ("burst_rounds_5s", "sustained_rpm", "caliber_weighted_rpm"):
             if all(profile[key] is not None for profile, _ in profiles):
                 metrics[key] = sum(profile[key] * count for profile, count in profiles)
@@ -78,7 +79,7 @@ def summarize_weapons(weapons: list[tuple[dict, int]], cp: float | None) -> dict
             )
         if cp is not None and cp > 0 and metrics["sustained_rpm"] is not None:
             metrics["rounds_per_minute_per_cp"] = metrics["sustained_rpm"] / cp
-    metrics["weapon_count"] = sum(count for _, count in weapons)
+    metrics["weapon_count"] = sum(count for _, count in weapons) if quantities_known else None
     metrics["weapons"] = [
         {"name": weapon.get("display_name") or weapon.get("id") or "Unknown weapon", "count": count}
         for weapon, count in weapons
@@ -104,14 +105,14 @@ def annotate_firepower(trees: list[dict]) -> None:
             elif node.get("unit_class") == "infantry" and not (node.get("unit") or {}).get("vehicle"):
                 for member in node.get("members") or []:
                     weapons = member.get("weapons") or []
-                    if member.get("count", 0) > 0:
+                    if member.get("count") is None or member["count"] > 0:
                         # An unknown main weapon must not silently lower the primary score.
-                        slots["primary"].append((weapons[0] if weapons else {}, member["count"]))
+                        slots["primary"].append((weapons[0] if weapons else {}, member.get("count")))
                         if len(weapons) > 1:
-                            slots["secondary"].append((weapons[1], member["count"]))
+                            slots["secondary"].append((weapons[1], member.get("count")))
                         for index, weapon in enumerate(weapons[2:], start=2):
                             identity = weapon.get("id") or weapon.get("display_name") or index
-                            other_weapons[identity].append((weapon, member["count"]))
+                            other_weapons[identity].append((weapon, member.get("count")))
 
             cp = (node.get("unit") or {}).get("cp")
             group = firepower_group(node)

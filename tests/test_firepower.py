@@ -99,6 +99,40 @@ class FirepowerTests(unittest.TestCase):
         self.assertEqual(vehicle["firepower"]["primary"]["percentiles"]["sustained_rpm"], 50)
         self.assertEqual(other_faction["firepower"]["primary"]["percentiles"]["sustained_rpm"], 50)
 
+    def test_unknown_member_quantity_invalidates_affected_slots_not_profiles(self):
+        known = infantry()
+        unknown = infantry(count=2, weapons=[weapon(), weapon(), weapon()])
+        unknown['members'].append({'count': None, 'raw_count': '_m621',
+                                   'weapons': [weapon(), weapon(), weapon()]})
+        annotate_firepower([{'nodes': [known, unknown]}])
+        for slot in [unknown['firepower']['primary'], unknown['firepower']['secondary'],
+                     *unknown['firepower']['other']]:
+            self.assertIsNone(slot['weapon_count'])
+            for key in ('burst_rounds_5s', 'sustained_rpm', 'rounds_per_minute_per_cp',
+                        'caliber_weighted_rpm', 'firing_endurance_seconds'):
+                self.assertIsNone(slot[key])
+            self.assertEqual(slot['percentiles'], {})
+            self.assertIsNone(slot['weapons'][-1]['count'])
+        self.assertEqual(known['firepower']['primary']['percentiles']['sustained_rpm'], 50)
+        self.assertEqual(weapon_firepower(weapon())['sustained_rpm'], 45)
+
+    def test_unknown_count_without_resolved_weapon_is_not_omitted(self):
+        node = infantry()
+        node['members'].append({'count': None, 'weapons': []})
+        annotate_firepower([{'nodes': [node]}])
+        self.assertIsNone(node['firepower']['primary']['sustained_rpm'])
+        self.assertIsNone(node['firepower']['primary']['weapon_count'])
+        self.assertEqual(node['firepower']['primary']['percentiles'], {})
+
+    def test_zero_count_is_absent_and_unknown_crew_does_not_change_mounts(self):
+        node = infantry()
+        node['members'].append({'count': 0, 'weapons': []})
+        vehicle = infantry(count=None)
+        vehicle['vehicle_weapons'] = [weapon(mounts=2)]
+        annotate_firepower([{'nodes': [node, vehicle]}])
+        self.assertEqual(node['firepower']['primary']['sustained_rpm'], 45)
+        self.assertEqual(vehicle['firepower']['primary']['sustained_rpm'], 90)
+
     def test_unarmed_object_is_unknown(self):
         node = {"unit_class": "other", "unit": {"cp": 2}}
         annotate_firepower([{"nodes": [node]}])
