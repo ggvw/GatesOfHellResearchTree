@@ -6,8 +6,22 @@ is a separate mode; AI cards have no prerequisite edges. AI source records are
 not inferred from research grants, and AI-only purchases are retained.
 
 Choose a campaign duration and a reachable numbered AI variant, or their union.
-Columns group first unlock stages (sparse stages are compacted); row bands group
-the Lua `base` category. Multiple cards in the same band/stage stack vertically.
+Colored columns group first unlock stages and label the actual numeric stage
+(sparse stages are compacted); unresolved first stages use **Unknown stage**.
+Horizontal headings group the Lua `base` category and show each cell's card count.
+Each stage adapts to its largest cell, from two to six card columns. Cells show
+at most two tile rows and scroll independently: wheel or scroll the cell scrollbar
+to reach every purchase, or focus a cell and use keyboard scrolling. Drag headings
+or gaps to pan; wheel over headings/gaps or Ctrl+wheel over a cell zooms the graph.
+The initial AI view frames the first three category rows of the first stage at a
+minimum 70px card width on a normal desktop. Narrow/short windows may show fewer
+rows rather than shrinking cards further. **Fit tree** explicitly fits the full
+stage/category overview, including all cell viewports, not all locally scrollable
+cards simultaneously; large overviews can have tiny cards. AI overview fitting can
+zoom below the research graph's minimum scale; buttons and wheel continue smoothly
+from that fitted scale. Switching faction or
+AI selection restores the readable initial view. Ordinary unit filters preserve
+the current pan/zoom; branch filters rebuild cells for the visible subset.
 Cards show their first and maximum stage. **Eligible at stage** removes purchases
 outside their known inclusive min/max interval; unresolved purchases remain
 visible and are labelled **eligibility unknown**. The duration schedule states

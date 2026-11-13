@@ -2120,6 +2120,17 @@ body.table-mode .graph-control, body.table-mode #hint { display: none; }
 .edge { stroke: var(--line); stroke-width: 3; fill: none; opacity: .7; }
 .edge.highlight { stroke: var(--required); stroke-width: 5; opacity: 1; }
 .edge.dimmed { opacity: .12; }
+.ai-stage-band { position: absolute; background: #163c48b8; border: 2px solid #5f939f; border-radius: 8px; color: #e4f3f5; }
+.ai-stage-band.alternate { background: #39324ab8; border-color: #9482af; }
+.ai-stage-band h2 { margin: 8px 12px; font-size: 24px; }
+.ai-category-heading { position: absolute; left: 0; right: 0; margin: 0; padding: 6px 12px; height: 36px; box-sizing: border-box; background: #08191cbb; border-top: 1px solid #91a6ac; font-size: 20px; }
+.ai-tile-cell { position: absolute; left: 0; right: 0; overflow-y: auto; overflow-x: hidden; scrollbar-gutter: stable; overscroll-behavior: contain; }
+.ai-tile-cell:focus-visible { outline: 3px solid var(--accent); }
+.ai-card-label { position: absolute; top: 0; left: 0; right: 0; background: #171b1de8; color: #e4eded; font-size: 10px; }
+html[data-theme="light"] .ai-card-label { background: #eef4f1ee; color: #182022; }
+html[data-theme="light"] .ai-stage-band { background: #c8e2e9; border-color: #557e89; color: #172b33; }
+html[data-theme="light"] .ai-stage-band.alternate { background: #e0d6ed; border-color: #8b74a2; }
+html[data-theme="light"] .ai-category-heading { background: #ffffffa8; border-color: #889b9e; }
 .node { position: absolute; width: 150px; height: 184px; border: 2px solid #687174; border-radius: 7px; overflow: hidden; background: #22282a; box-shadow: 0 3px 8px #0009; cursor: pointer; user-select: none; transition: opacity .15s, border-color .15s, box-shadow .15s; }
 .node:hover { border-color: #f0d28a; box-shadow: 0 0 12px #e0ad4f88; z-index: 3; }
 .node.tech { border-color: #9a7d3d; }
@@ -2805,24 +2816,99 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       nodes.push({...template, id, requires: [], cost: null, ai_records: records,
         ai_min: minimum, ai_max: maximum, ai_category: first.category});
     }
+    layoutAiCells(nodes);
+    return nodes;
+  }
+
+  function layoutAiCells(nodes) {
     const categories = [...new Set(nodes.map(node => node.ai_category))].sort();
     const stages = [...new Set(nodes.map(node => node.ai_min))].sort((a,b) => (a ?? Infinity) - (b ?? Infinity));
-    const rows = new Map(), counts = new Map();
-    for (const category of categories) {
-      let height = 1;
-      for (const value of stages) height = Math.max(height, nodes.filter(n => n.ai_category === category && n.ai_min === value).length);
-      rows.set(category, [...counts.values()].reduce((a,b) => a+b, 0)); counts.set(category, height);
-    }
+    const cells = new Map();
     for (const node of nodes) {
-      const peers = nodes.filter(n => n.ai_category === node.ai_category && n.ai_min === node.ai_min);
-      node.position = {x: stages.indexOf(node.ai_min), y: rows.get(node.ai_category) + peers.indexOf(node)};
+      const key = JSON.stringify([node.ai_category, node.ai_min]);
+      if (!cells.has(key)) cells.set(key, []);
+      cells.get(key).push(node);
     }
-    return nodes;
+    const widths = stages.map(stage => Math.min(6, Math.max(2, Math.ceil(Math.sqrt(Math.max(1,
+      ...categories.map(category => (cells.get(JSON.stringify([category, stage])) || []).length)))))));
+    let x = 0;
+    const columns = stages.map((stage, index) => {
+      const column = {stage, x, width: widths[index] * 166 + 20, tiles: widths[index]};
+      x += column.width + 16;
+      return column;
+    });
+    let y = 48;
+    const rows = categories.map(category => {
+      const tileRows = Math.min(2, Math.max(...columns.map(column => Math.ceil((cells.get(JSON.stringify([category, column.stage])) || []).length / column.tiles)), 1));
+      const row = {category, y, height: 38 + tileRows * 200 - 10};
+      y += row.height + 12;
+      return row;
+    });
+    for (const row of rows) for (const column of columns) {
+      const peers = cells.get(JSON.stringify([row.category, column.stage])) || [];
+      peers.forEach((node, index) => {
+        node.position = {x: (column.x + 10 + index % column.tiles * 166) / 184,
+          y: (row.y + 38 + Math.floor(index / column.tiles) * 200) / 202};
+        node.ai_tile = {x: 10 + index % column.tiles * 166, y: Math.floor(index / column.tiles) * 200};
+      });
+    }
+    return {columns, rows, width: x, height: y, cells};
+  }
+
+  function renderAiCells(visibleIds = null) {
+    const nodes = tree.nodes.filter(node => !visibleIds || visibleIds.has(node.id));
+    const layout = layoutAiCells(nodes);
+    const scrollPositions = new Map([...nodesLayer.querySelectorAll('.ai-tile-cell')].map(cell => [cell.dataset.cellKey, cell.scrollTop]));
+    nodesLayer.replaceChildren();
+    layoutPositions = new Map();
+    for (const [id, card] of nodeElements) card.style.display = !visibleIds || visibleIds.has(id) ? '' : 'none';
+    for (const [index, column] of layout.columns.entries()) {
+      const band = document.createElement('section');
+      band.className = 'ai-stage-band' + (index % 2 ? ' alternate' : '');
+      Object.assign(band.style, {left: PAD + column.x + 'px', top: PAD + 'px', width: column.width + 'px', height: layout.height + 'px'});
+      const heading = document.createElement('h2');
+      heading.textContent = column.stage == null ? 'Unknown stage' : `Stage ${column.stage}`;
+      band.append(heading);
+      for (const row of layout.rows) {
+        const peers = layout.cells.get(JSON.stringify([row.category, column.stage])) || [];
+        const title = document.createElement('h3');
+        title.className = 'ai-category-heading';
+        title.style.top = row.y + 'px';
+        title.textContent = `${row.category || 'Unknown category'} · ${peers.length}`;
+        band.append(title);
+        const cell = document.createElement('div');
+        cell.className = 'ai-tile-cell';
+        cell.dataset.cellKey = JSON.stringify([row.category, column.stage]);
+        cell.tabIndex = 0;
+        cell.setAttribute('aria-label', `${heading.textContent}, ${title.textContent}. Scroll for more units.`);
+        Object.assign(cell.style, {top: row.y + 38 + 'px', height: row.height - 38 + 'px'});
+        for (const node of peers) {
+          const card = nodeElements.get(node.id);
+          card.style.left = node.ai_tile.x + 'px'; card.style.top = node.ai_tile.y + 'px';
+          cell.append(card);
+          layoutPositions.set(node.id, {x: PAD + column.x + node.ai_tile.x, y: PAD + row.y + 38 + node.ai_tile.y});
+        }
+        // Wheel scrolling stays local to a cell; drag its heading or the gaps to pan.
+        cell.addEventListener('wheel', event => { if (!event.ctrlKey) event.stopPropagation(); }, {passive:true});
+        cell.addEventListener('pointerdown', event => event.stopPropagation());
+        band.append(cell);
+      }
+      nodesLayer.append(band);
+      for (const cell of band.querySelectorAll('.ai-tile-cell')) cell.scrollTop = scrollPositions.get(cell.dataset.cellKey) || 0;
+    }
+    tree.ai_layout = layout;
+    worldWidth = PAD * 2 + layout.width; worldHeight = PAD * 2 + layout.height;
+    world.style.width = worldWidth + 'px'; world.style.height = worldHeight + 'px';
+    edgesLayer.setAttribute('width', worldWidth); edgesLayer.setAttribute('height', worldHeight);
+    edgesLayer.setAttribute('viewBox', `0 0 ${worldWidth} ${worldHeight}`);
   }
 
   function prepareAiTree(source) {
     const active = document.getElementById('graph-source').value === 'ai';
     document.getElementById('ai-controls').hidden = !active;
+    document.getElementById('hint').textContent = active
+      ? 'Scroll cells for more units · drag headings/gaps to pan · Ctrl+wheel to zoom'
+      : 'Drag to pan · wheel to zoom · click a node for details';
     if (!active) return source;
     const duration = document.getElementById('ai-duration'), variant = document.getElementById('ai-variant');
     const options = (element, values) => {
@@ -2898,7 +2984,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
       const atWeaponBadge = node.anti_tank_weapon_count > 0 ? `<span class="at-count-badge" title="Infantry carrying AT launchers or AT hand grenades">AT ×${esc(node.anti_tank_weapon_count)}</span>` : '';
       const lowerLeftBadges = cpBadge || reloadBadge || atWeaponBadge ? `<div class="lower-left-badges">${cpBadge}${reloadBadge}${atWeaponBadge}</div>` : '';
       const indirectIcon = node.indirect_fire ? '<span class="indirect-icon" title="Indirect fire capability" aria-label="Indirect fire capability"><svg viewBox="0 0 24 20" aria-hidden="true"><path d="M2 17 Q8 2 18 7" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="2 2"/><path d="M15 4 L20 7 L16 11" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="3" cy="17" r="2" fill="currentColor"/></svg></span>' : '';
-      card.innerHTML = `${node.ai_category ? `<span style="position:absolute;top:0;left:0;right:0;background:#171b1de8;font-size:10px">${esc(node.ai_category)} · ${node.ai_min == null || node.ai_max == null ? 'eligibility unknown' : 'stage ' + esc(node.ai_min)}</span>` : ''}${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${tree.ai_mode ? `Stage ${esc(node.ai_min ?? '?')} · max ${esc(node.ai_max ?? '?')}` : flaskIcon + esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
+      card.innerHTML = `${node.ai_category ? `<span class="ai-card-label">${esc(node.ai_category)} · ${node.ai_min == null || node.ai_max == null ? 'eligibility unknown' : 'stage ' + esc(node.ai_min)}</span>` : ''}${image}${infantryLevel}${shovelIcon}${indirectIcon}${scoutIcon}${sniperIcon}${lowerLeftBadges}<div class="badges"><span class="badge" title="Research points needed">${tree.ai_mode ? `Stage ${esc(node.ai_min ?? '?')} · max ${esc(node.ai_max ?? '?')}` : flaskIcon + esc(number(node.cost))}</span>${unitBadge}</div><div class="node-title">${esc(node.display_name)}</div>`;
       card.addEventListener('click', event => { event.stopPropagation(); selectNode(node.id); });
       nodesLayer.append(card); nodeElements.set(node.id, card);
     }
@@ -2909,6 +2995,7 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   }
 
   function updateGraphLayout(visibleIds = null) {
+    if (tree.ai_mode) { renderAiCells(visibleIds); return; }
     const visibleNodes = tree.nodes.filter(node => !visibleIds || visibleIds.has(node.id));
     const compact = visibleIds !== null;
     const visibleRows = [...new Set(visibleNodes.map(node => node.position.y))].sort((a, b) => a - b);
@@ -3349,8 +3436,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (viewMode === 'table') return;
     const availableWidth = viewport.clientWidth;
     const availableHeight = viewport.clientHeight;
-    scale = Math.min(.8, availableWidth / worldWidth, availableHeight / worldHeight);
-    scale = Math.max(.06, scale);
+    scale = tree.ai_mode
+      ? Math.min(.8, Math.max(1, availableWidth - 24) / worldWidth, Math.max(1, availableHeight - 24) / worldHeight)
+      : Math.max(.06, Math.min(.8, availableWidth / worldWidth, availableHeight / worldHeight));
     tx = (availableWidth - worldWidth * scale) / 2;
     ty = Math.max(12, (availableHeight - worldHeight * scale) / 2);
     setTransform();
@@ -3358,6 +3446,16 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
 
   function startView() {
     if (viewMode === 'table') return;
+    if (tree.ai_mode && tree.ai_layout?.columns.length) {
+      const layout = tree.ai_layout;
+      const bottom = layout.rows[Math.min(2, layout.rows.length - 1)];
+      const height = bottom ? PAD + bottom.y + bottom.height + 20 : 500;
+      scale = Math.max(70 / NODE_W, Math.min(.8, (viewport.clientHeight - 24) / height,
+        (viewport.clientWidth - 24) / (layout.columns[0].width + PAD * 2)));
+      tx = 12; ty = 12;
+      setTransform();
+      return;
+    }
     scale = Math.max(.18, Math.min(.65, viewport.clientWidth * .92 / worldWidth));
     tx = (viewport.clientWidth - worldWidth * scale) / 2;
     ty = 20;
@@ -3365,7 +3463,9 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
   }
 
   function zoomAt(factor, cx = viewport.clientWidth / 2, cy = viewport.clientHeight / 2) {
-    const next = Math.max(.05, Math.min(2.5, scale * factor));
+    const next = tree.ai_mode
+      ? Math.min(2.5, scale * factor)
+      : Math.max(.05, Math.min(2.5, scale * factor));
     const wx = (cx - tx) / scale, wy = (cy - ty) / scale;
     tx = cx - wx * next; ty = cy - wy * next; scale = next; setTransform();
   }
@@ -3375,7 +3475,15 @@ html[data-theme="light"] { --table-background: #e9eeea; --table-surface: #f8faf7
     if (!selectedNodeId || nodeElements.get(selectedNodeId)?.style.display === 'none') return;
     const node = byId.get(selectedNodeId);
     if (!node) return;
-    const position = nodePosition(node), margin = 12;
+    const position = {...nodePosition(node)}, margin = 12;
+    if (tree.ai_mode) {
+      const card = nodeElements.get(node.id), cell = card?.closest('.ai-tile-cell');
+      if (cell) {
+        if (card.offsetTop < cell.scrollTop) cell.scrollTop = card.offsetTop;
+        else if (card.offsetTop + NODE_H > cell.scrollTop + cell.clientHeight) cell.scrollTop = card.offsetTop + NODE_H - cell.clientHeight;
+        position.y -= cell.scrollTop;
+      }
+    }
     scale = Math.min(scale, Math.max(.05, (viewport.clientWidth - margin * 2) / NODE_W));
     const left = position.x * scale + tx, top = position.y * scale + ty;
     if (left < margin) tx += margin - left;
